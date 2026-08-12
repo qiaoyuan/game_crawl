@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+*.egg-info/
+
+# 会话 & 下载
+session.json
+downloads/
+
+# 调试截图
+debug_*.png
+
+# IDE
+.vscode/
+.idea/
