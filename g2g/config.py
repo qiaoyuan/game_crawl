@@ -1,6 +1,18 @@
 """G2G 配置"""
 
 import os
+from dotenv import load_dotenv
+
+# 路径
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DOWNLOAD_DIR = os.path.join(ROOT_DIR, "downloads")
+SESSION_FILE = os.path.join(ROOT_DIR, "session.json")
+
+# 环境：local=本地开发 / prod=生产（可用系统环境变量 APP_ENV 覆盖）
+APP_ENV = os.environ.get("APP_ENV", "local").strip().lower()
+
+# 按环境加载配置：生产读 .env.prod，本地读 .env
+load_dotenv(os.path.join(ROOT_DIR, ".env.prod" if APP_ENV == "prod" else ".env"))
 
 # 账号
 EMAIL = "34348492@qq.com"
@@ -23,24 +35,12 @@ EXPORT_PAYLOAD = {
     "out_of_stock": False,
 }
 
-# 数据库
-# DB_HOST = os.environ.get("DB_HOST", "localhost")
-# DB_PORT = int(os.environ.get("DB_PORT", "3306"))
-# DB_USER = os.environ.get("DB_USER", "root")
-# DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
-# DB_NAME = os.environ.get("DB_NAME", "game_platform")
-
-# 正式
-DB_HOST = os.environ.get("DB_HOST", "43.106.27.46")
+# 数据库（从 .env / .env.prod 读取，未配置时回退到本地默认值）
+DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = int(os.environ.get("DB_PORT", "3306"))
-DB_USER = os.environ.get("DB_USER", "game_platform")
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "fkxE887YYAPnJXDW")
+DB_USER = os.environ.get("DB_USER", "root")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 DB_NAME = os.environ.get("DB_NAME", "game_platform")
-
-# 路径
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DOWNLOAD_DIR = os.path.join(ROOT_DIR, "downloads")
-SESSION_FILE = os.path.join(ROOT_DIR, "session.json")
 
 # 浏览器
 USER_AGENT = (

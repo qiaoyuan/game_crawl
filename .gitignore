@@ -8,6 +8,10 @@ venv/
 session.json
 downloads/
 
+# 环境配置（.env.example 模板保留提交）
+.env
+.env.prod
+
 # 调试截图
 debug_*.png
 
