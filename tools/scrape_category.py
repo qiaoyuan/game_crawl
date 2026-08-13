@@ -14,10 +14,9 @@ from playwright.async_api import async_playwright
 from g2g import config
 
 DEFAULT_URL = (
-    "https://www.g2g.com/cn/categories/wow-classic-era-vanilla-gold/offer/group"
-    "?fa=lgc_27816_platform%3Algc_27816_platform_54790"
+    "https://www.g2g.com/cn/categories/wow-gold/offer/group"
+    "?fa=lgc_2299_platform%3Algc_2299_platform_39979"
     "&region_id=dfced32f-2f0a-4df5-a218-1e068cfadffa"
-    "&sort=lowest_price"
 )
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -133,7 +132,7 @@ async def scrape(url: str = DEFAULT_URL):
                         const t = badge.innerText.trim();
                         if (!t) return;
                         // "Min. 3k" / "最低 3k" → 最低起订
-                        if (t.startsWith('最低') || t.match(/^Min\.?\\s/i)) {
+                        if (t.startsWith('最低') || t.match(/^Min\\.?\\s/i)) {
                             item.min_order = t;
                         }
                         // "10 Mins" / "30 Mins" / "10分钟 - 50分钟" → 交货时间

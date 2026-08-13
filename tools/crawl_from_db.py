@@ -284,6 +284,147 @@ async def scrape_page(page, url: str) -> list:
     return items
 
 
+async def scrape_other_offer_page(page, url: str) -> list:
+    """爬取游戏币分类页 #pcOtherOffer 下的竞品商户卡片"""
+    print(f"  [*] 打开游戏币页面: {url}")
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+    # 分类页的竞品列表是异步渲染的，先等待容器和首批卡片出现。
+    card_selector = "#pcOtherOffer .other-seller--gradient"
+    for i in range(60):
+        cards = await page.query_selector_all(card_selector)
+        if cards:
+            print(f"  -> 检测到 {len(cards)} 个竞品商户 ({i + 1}s)")
+            break
+        await asyncio.sleep(1)
+
+    # 页面可能在滚动后继续加载竞品，连续两轮数量不变才停止。
+    previous_count = -1
+    stable_rounds = 0
+    for _ in range(10):
+        count = len(await page.query_selector_all(card_selector))
+        if count == previous_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+        if stable_rounds >= 2:
+            break
+        previous_count = count
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(2)
+
+    items_raw = await page.evaluate(
+        """
+        () => {
+            const container = document.querySelector('#pcOtherOffer');
+            if (!container) return [];
+
+            const cards = container.querySelectorAll('.other-seller--gradient');
+            const results = [];
+            const absoluteUrl = (href) => {
+                try { return new URL(href, window.location.href).href; }
+                catch (_) { return href; }
+            };
+
+            cards.forEach(card => {
+                const item = {};
+                const text = (selector) => {
+                    const element = card.querySelector(selector);
+                    return element ? element.innerText.trim() : '';
+                };
+
+                const sellerLink = card.querySelector('a[href]');
+                if (sellerLink) {
+                    const href = sellerLink.getAttribute('href') || '';
+                    item.seller_url = absoluteUrl(href);
+                    try {
+                        const segments = new URL(href, window.location.href).pathname
+                            .split('/').filter(Boolean);
+                        // 竞品卡片的店铺链接形如 /Sunstriders。
+                        if (segments.length === 1) item.seller_id = segments[0];
+                    } catch (_) {}
+                }
+
+                const sellerName = text('.text-body2.ellipsis.text-weight-medium');
+                if (sellerName) item.seller_name = sellerName;
+
+                const sellerLevel = text('.text-caption.text-secondary.text-weight-medium');
+                if (sellerLevel) item.seller_level = sellerLevel;
+
+                const productTitle = text('.product-card__bg-text');
+                if (productTitle) item.product_title = productTitle;
+
+                const avatar = card.querySelector('img.user-avatar');
+                if (avatar) item.avatar = avatar.src;
+                item.is_online = !!card.querySelector('.g-round-indicator.bg-positive');
+
+                const rating = text('.text-positive.text-weight-medium.q-ml-xs');
+                if (rating) item.rating = rating;
+
+                // 已售出可能位于普通 badge，也可能位于 role=alert 的 badge。
+                card.querySelectorAll('.bg-neutral-100-light.text-secondary, [role="alert"]')
+                    .forEach(element => {
+                        const value = element.innerText.trim();
+                        if (/已售出|sold/i.test(value)) item.sold_count = value;
+                    });
+
+                card.querySelectorAll('.q-badge__delivery').forEach(badge => {
+                    const value = badge.innerText.trim();
+                    if (!value) return;
+                    if (/^(最低|Min\\.?\\s)/i.test(value)) {
+                        item.min_order = value;
+                    } else if (/\\d+\\s*(分钟|小时|Mins?|Hours?|Hr|Minute|Hour)/i.test(value)) {
+                        item.delivery_time = value;
+                    } else if (/^[\\d.,]+[kKmM]?$/.test(value)) {
+                        item.stock = value;
+                    }
+                });
+
+                const discount = card.querySelector('.q-chip__content');
+                if (discount) item.has_volume_discount = /折扣|discount/i.test(discount.innerText);
+
+                const price = card.querySelector('.text-primary.text-body.text-weight-bold');
+                if (price) item.unit_price_raw = price.innerText.trim();
+
+                const currency = card.querySelector('.text-secondary.text-body2.text-weight-medium');
+                if (currency) item.currency_label = currency.innerText.trim();
+
+                const priceLabel = card.querySelector('.text-secondary.text-caption-1');
+                if (priceLabel) item.price_label = priceLabel.innerText.trim();
+
+                const offerLink = card.querySelector('a[href*="/offer/"]');
+                if (offerLink) item.offer_url = absoluteUrl(offerLink.getAttribute('href') || '');
+
+                results.push(item);
+            });
+            return results;
+        }
+        """
+    )
+
+    items = []
+    valid_currency_codes = {
+        "USD", "SGD", "EUR", "GBP", "AUD", "CAD", "JPY", "CNY", "HKD",
+        "MYR", "KRW", "INR", "THB", "PHP", "IDR", "CHF", "NZD", "BRL",
+    }
+    for raw in items_raw:
+        item = dict(raw)
+        price_raw = raw.get("unit_price_raw", "")
+        currency_label = raw.get("currency_label", "").strip().upper()
+        parsed_currency, parsed_price = parse_currency_from_price(price_raw)
+
+        if not parsed_currency and currency_label in valid_currency_codes:
+            parsed_currency = currency_label
+        item["price"] = parsed_price or price_raw
+        item["unit_price"] = item["price"]
+        item["currency"] = parsed_currency or "USD"
+        item.pop("unit_price_raw", None)
+        item.pop("currency_label", None)
+        items.append(item)
+
+    return items
+
+
 async def run():
     # 读取目标
     targets = db.get_pending_targets()
@@ -317,16 +458,22 @@ async def run():
             target_id = target.get("id")
             url = target.get("url")
             name = target.get("name", "")
-            platform = "eldorado" if "eldorado.gg" in url else "g2g"
+            category = str(target.get("category") or "").strip()
 
             if not url:
                 print(f"  [{idx+1}/{len(targets)}] 跳过: 无 URL")
                 continue
 
-            print(f"\n[{idx+1}/{len(targets)}] {name} (target_id={target_id})")
+            platform = "eldorado" if "eldorado.gg" in url else "g2g"
+            category_label = category or "未设置类别"
+            print(f"\n[{idx+1}/{len(targets)}] {name} (target_id={target_id}, category={category_label})")
 
             try:
-                items = await scrape_page(page, url)
+                # 游戏币分类页使用 #pcOtherOffer 竞品商户卡片；物品及历史目标保持原解析逻辑。
+                if category == "游戏币":
+                    items = await scrape_other_offer_page(page, url)
+                else:
+                    items = await scrape_page(page, url)
                 print(f"  -> 提取 {len(items)} 条")
 
                 inserted, updated = db.save_crawl_data(target_id, platform, items)
