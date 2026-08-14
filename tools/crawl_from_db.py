@@ -456,10 +456,20 @@ async def run():
         total_saved = 0
         for idx, target in enumerate(targets):
             target_id = target.get("id")
-            game_product_id = target.get("game_product_id") or 0
+            try:
+                game_product_id = int(target.get("game_product_id") or 0)
+            except (TypeError, ValueError):
+                game_product_id = 0
             url = target.get("url")
             name = target.get("name", "")
             category = str(target.get("category") or "").strip()
+
+            if game_product_id <= 0:
+                print(
+                    f"  [{idx+1}/{len(targets)}] {name} 跳过: "
+                    f"未关联游戏产品 (game_product_id={game_product_id})"
+                )
+                continue
 
             if not url:
                 print(f"  [{idx+1}/{len(targets)}] 跳过: 无 URL")
