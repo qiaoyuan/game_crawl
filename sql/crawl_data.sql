@@ -2,6 +2,7 @@
 CREATE TABLE IF NOT EXISTS `game_platform`.`crawl_data` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
   `target_id` BIGINT UNSIGNED NOT NULL COMMENT '关联 crawl_target.id',
+  `game_product_id` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '关联游戏产品ID',
   `platform` VARCHAR(32) NOT NULL DEFAULT 'g2g' COMMENT '平台: g2g/eldorado',
 
   -- 卖家信息
@@ -34,6 +35,8 @@ CREATE TABLE IF NOT EXISTS `game_platform`.`crawl_data` (
 
   PRIMARY KEY (`id`),
   KEY `idx_target_id` (`target_id`),
+  KEY `idx_game_product_id` (`game_product_id`),
+  UNIQUE KEY `uk_target_game_product_seller` (`target_id`, `game_product_id`, `seller_id`),
   KEY `idx_platform_seller` (`platform`, `seller_id`),
   KEY `idx_crawled_at` (`crawled_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='爬取数据表';

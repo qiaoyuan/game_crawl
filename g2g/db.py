@@ -45,8 +45,13 @@ def update_last_crawl(target_id: int):
         conn.close()
 
 
-def save_crawl_data(target_id: int, platform: str, items: list) -> tuple:
-    """批量保存爬取数据（存在则更新价格/库存/时间，不存在则新增）"""
+def save_crawl_data(
+    target_id: int,
+    platform: str,
+    items: list,
+    game_product_id: int = 0,
+) -> tuple:
+    """批量保存爬取数据，并记录目标关联的游戏产品 ID。"""
     if not items:
         return 0, 0
 
@@ -57,7 +62,7 @@ def save_crawl_data(target_id: int, platform: str, items: list) -> tuple:
         with conn.cursor() as cur:
             sql = """
                 INSERT INTO crawl_data (
-                    target_id, platform,
+                    target_id, game_product_id, platform,
                     seller_id, seller_name, seller_level, seller_url, is_online,
                     product_title, offer_url,
                     sold_count, sold_count_num,
@@ -66,7 +71,7 @@ def save_crawl_data(target_id: int, platform: str, items: list) -> tuple:
                     min_order, delivery_time,
                     raw_data, crawled_at
                 ) VALUES (
-                    %s, %s,
+                    %s, %s, %s,
                     %s, %s, %s, %s, %s,
                     %s, %s,
                     %s, %s,
@@ -76,6 +81,7 @@ def save_crawl_data(target_id: int, platform: str, items: list) -> tuple:
                     %s, %s
                 )
                 ON DUPLICATE KEY UPDATE
+                    game_product_id = VALUES(game_product_id),
                     price = VALUES(price),
                     currency = VALUES(currency),
                     stock = VALUES(stock),
@@ -96,6 +102,7 @@ def save_crawl_data(target_id: int, platform: str, items: list) -> tuple:
                 import json
                 row = (
                     target_id,
+                    game_product_id,
                     platform,
                     item.get("seller_id"),
                     item.get("seller_name"),

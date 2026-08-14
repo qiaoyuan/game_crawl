@@ -456,6 +456,7 @@ async def run():
         total_saved = 0
         for idx, target in enumerate(targets):
             target_id = target.get("id")
+            game_product_id = target.get("game_product_id") or 0
             url = target.get("url")
             name = target.get("name", "")
             category = str(target.get("category") or "").strip()
@@ -466,17 +467,26 @@ async def run():
 
             platform = "eldorado" if "eldorado.gg" in url else "g2g"
             category_label = category or "未设置类别"
-            print(f"\n[{idx+1}/{len(targets)}] {name} (target_id={target_id}, category={category_label})")
+            print(
+                f"\n[{idx+1}/{len(targets)}] {name} "
+                f"(target_id={target_id}, game_product_id={game_product_id}, "
+                f"category={category_label})"
+            )
 
             try:
-                # 游戏币分类页使用 #pcOtherOffer 竞品商户卡片；物品及历史目标保持原解析逻辑。
-                if category == "游戏币":
+                # “金币”和“游戏币”都是 /offer/group 分类页，使用 #pcOtherOffer 竞品商户卡片。
+                if category in {"金币", "游戏币"}:
                     items = await scrape_other_offer_page(page, url)
                 else:
                     items = await scrape_page(page, url)
                 print(f"  -> 提取 {len(items)} 条")
 
-                inserted, updated = db.save_crawl_data(target_id, platform, items)
+                inserted, updated = db.save_crawl_data(
+                    target_id,
+                    platform,
+                    items,
+                    game_product_id=game_product_id,
+                )
                 total_saved += inserted + updated
                 print(f"  -> 新增 {inserted} 条, 更新 {updated} 条")
 
