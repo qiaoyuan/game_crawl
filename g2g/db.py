@@ -93,6 +93,7 @@ def save_crawl_data(
                     stock, stock_num,
                     price, currency,
                     min_order, delivery_time,
+                    rating,
                     raw_data, crawled_at
                 ) VALUES (
                     %s, %s, %s, %s,
@@ -102,6 +103,7 @@ def save_crawl_data(
                     %s, %s,
                     %s, %s,
                     %s, %s,
+                    %s,
                     %s, %s
                 )
             """
@@ -128,6 +130,7 @@ def save_crawl_data(
                     item.get("currency"),
                     item.get("min_order"),
                     item.get("delivery_time"),
+                    item.get("rating"),
                     json.dumps(item, ensure_ascii=False),
                     now,
                 )

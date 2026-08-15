@@ -62,6 +62,19 @@ def parse_currency_from_price(price_text: str) -> tuple[str | None, str | None]:
     return None, text
 
 
+def parse_rating(text: str | None) -> str | None:
+    """解析好评率，去掉 % 号，保留两位小数字符串。
+    例如: '96.00%' -> '96.00', '100%' -> '100.00', '0.00%' -> '0.00'
+    """
+    if not text:
+        return None
+    t = text.strip().rstrip("%").strip()
+    try:
+        return f"{float(t):.2f}"
+    except ValueError:
+        return None
+
+
 async def scrape_page(page, url: str) -> list:
     """爬取单个页面的产品卡片"""
     print(f"  [*] 打开: {url}")
@@ -274,6 +287,10 @@ async def scrape_page(page, url: str) -> list:
         item["currency"] = parsed_currency
         item["price"] = price_raw
 
+        # 好评率：去掉 % 号，统一保留两位小数的字符串，如 "96.00"
+        rating_raw = item.get("rating", "")
+        item["rating"] = parse_rating(rating_raw)
+
         # 清理临时字段
         item.pop("price_raw", None)
         item.pop("currency_from_price", None)
@@ -418,6 +435,8 @@ async def scrape_other_offer_page(page, url: str) -> list:
         item["price"] = parsed_price or price_raw
         item["unit_price"] = item["price"]
         item["currency"] = parsed_currency or "USD"
+        # 好评率：去掉 % 号，统一保留两位小数的字符串，如 "96.00"
+        item["rating"] = parse_rating(raw.get("rating", ""))
         item.pop("unit_price_raw", None)
         item.pop("currency_label", None)
         items.append(item)
