@@ -484,25 +484,31 @@ async def run():
             )
 
             try:
-                # “金币”和“游戏币”都是 /offer/group 分类页，使用 #pcOtherOffer 竞品商户卡片。
+                # 爬取前先将版本号 +1，本批数据全部使用新版本号写入。
+                # PHP 侧通过 crawl_target.version 对应 crawl_data.version 做改价策略。
+                version = db.increment_version(target_id)
+                print(f"  -> version={version}")
+
+                # "金币"和"游戏币"都是 /offer/group 分类页，使用 #pcOtherOffer 竞品商户卡片。
                 if category in {"金币", "游戏币"}:
                     items = await scrape_other_offer_page(page, url)
                 else:
                     items = await scrape_page(page, url)
                 print(f"  -> 提取 {len(items)} 条")
 
-                inserted, updated = db.save_crawl_data(
+                inserted = db.save_crawl_data(
                     target_id,
                     platform,
                     items,
                     game_product_id=game_product_id,
+                    version=version,
                 )
-                total_saved += inserted + updated
-                print(f"  -> 新增 {inserted} 条, 更新 {updated} 条")
+                total_saved += inserted
+                print(f"  -> 新增 {inserted} 条")
 
                 db.update_last_crawl(target_id)
                 # 发信号通知 PHP：该目标已爬完，由 PHP 消费通知后执行改价策略
-                db.insert_crawl_notify(target_id, inserted + updated)
+                db.insert_crawl_notify(target_id, inserted)
                 print(f"  -> 已写入爬取完成通知(crawl_notify)")
             except Exception as e:
                 print(f"  -> 错误: {e}")
