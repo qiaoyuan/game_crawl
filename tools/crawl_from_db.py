@@ -444,6 +444,343 @@ async def scrape_other_offer_page(page, url: str) -> list:
     return items
 
 
+async def scrape_eldorado_page(page, url: str) -> list:
+    """爬取 Eldorado 游戏币页面，优先直连官方 offers API，DOM 作为兜底。"""
+    from urllib.parse import parse_qs, quote, urlencode, urlparse
+
+    print(f"  [*] 打开 Eldorado 页面: {url}")
+
+    # 从商品页 URL 构造官方 offers API。
+    # /g/132-0-0 中 132=gameId、0=Currency；te_v0 对应 tradeEnvironmentValue0。
+    parsed_url = urlparse(url)
+    legacy_match = re.search(r"/g/(\d+)-(\d+)-(\d+)", parsed_url.path)
+    api_response = None
+    if legacy_match:
+        category_map = {"0": "Currency", "1": "Account", "2": "CustomItem"}
+        query = parse_qs(parsed_url.query)
+        params = [
+            ("gameId", legacy_match.group(1)),
+            ("category", category_map.get(legacy_match.group(2), "Currency")),
+        ]
+        for key, values in sorted(query.items()):
+            env_match = re.fullmatch(r"te_v(\d+)", key)
+            if env_match and values:
+                params.append((f"tradeEnvironmentValue{env_match.group(1)}", values[0]))
+        params.extend([
+            ("pageIndex", "1"),
+            ("pageSize", "150"),
+            ("offerSortingCriterion", query.get("offerSortingCriterion", ["Cheapest"])[0]),
+        ])
+        api_url = (
+            "https://www.eldorado.gg/api/predefinedOffers/augmentedGame/offers?"
+            + urlencode(params)
+        )
+        try:
+            api_response = await page.request.get(
+                api_url,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": url,
+                },
+                timeout=60000,
+            )
+            print(f"  -> Eldorado API 状态: {api_response.status}")
+        except Exception as e:
+            print(f"  [!] Eldorado API 直连失败: {e}")
+    else:
+        print("  [!] 无法从 URL 解析 Eldorado gameId，回退 DOM 解析")
+
+    def format_duration(value: str | None) -> str | None:
+        """将 API 的 TimeSpan 转成页面显示格式，如 00:06:28 -> 6 min。"""
+        if not value:
+            return None
+        try:
+            first, minutes, _seconds = value.split(":", 2)
+            if "." in first:
+                days_text, hours_text = first.split(".", 1)
+                days = int(days_text)
+                hours = int(hours_text)
+            else:
+                days = 0
+                hours = int(first)
+            if days:
+                return f"{days} d"
+            if hours:
+                return f"{hours} h"
+            return f"{max(1, int(minutes))} min"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def guaranteed_delivery_text(value: str | None) -> str | None:
+        if not value:
+            return None
+        match = re.match(r"^(Minute|Hour|Day)(\d+)$", value)
+        if not match:
+            return value
+        unit = {"Minute": "min", "Hour": "h", "Day": "d"}[match.group(1)]
+        return f"{match.group(2)} {unit}"
+
+    def unit_label(unit_system: str | None) -> str:
+        return {
+            "Unit1": "",
+            "Unit1000": "K",
+            "Unit1000000": "M",
+            "Unit1000000000": "B",
+        }.get(unit_system or "", "")
+
+    try:
+        if api_response is not None and api_response.ok:
+            payload = await api_response.json()
+            api_items = []
+            for record in payload.get("results", []):
+                offer = record.get("offer") or {}
+                user = record.get("user") or {}
+                order_info = record.get("userOrderInfo") or {}
+                delivery = record.get("deliveryTime") or {}
+
+                # 始终优先保存官方 USD 单价，避免页面按 IP 显示 SGD。
+                price_info = (
+                    offer.get("pricePerUnitInUSD")
+                    or offer.get("pricePerUnit")
+                    or {}
+                )
+                unit = unit_label(offer.get("unitSystem"))
+                username = str(user.get("username") or "").strip()
+                offer_id = str(offer.get("id") or "").strip()
+                game_alias = str(offer.get("gameSeoAlias") or "").strip()
+
+                median_text = format_duration(delivery.get("deliveryTimeMedian"))
+                expected_text = format_duration(delivery.get("expectedTime"))
+                if median_text and expected_text and median_text != expected_text:
+                    delivery_text = f"{median_text} - {expected_text}"
+                else:
+                    delivery_text = (
+                        median_text
+                        or expected_text
+                        or guaranteed_delivery_text(offer.get("guaranteedDeliveryTime"))
+                    )
+
+                trade_values = offer.get("tradeEnvironmentValues") or []
+                trade_name = " / ".join(
+                    str(value.get("value"))
+                    for value in trade_values
+                    if value.get("value")
+                )
+                title_parts = [offer.get("gameCategoryTitle"), trade_name]
+
+                score = order_info.get("feedbackScore")
+                try:
+                    rating = f"{float(score):.2f}" if score is not None else None
+                except (TypeError, ValueError):
+                    rating = None
+
+                seller_url = (
+                    f"https://www.eldorado.gg/users/{quote(username, safe='')}/shop/Currency"
+                    if username else None
+                )
+                offer_url = (
+                    f"https://www.eldorado.gg/{game_alias}/og/{offer_id}"
+                    if game_alias and offer_id else url
+                )
+                min_quantity = offer.get("minQuantity")
+
+                api_items.append({
+                    "seller_id": user.get("id") or offer.get("userId") or username,
+                    "seller_name": username or None,
+                    "seller_level": "Verified" if user.get("isVerifiedSeller") else None,
+                    "seller_url": seller_url,
+                    "is_online": False,
+                    "product_title": " - ".join(str(v) for v in title_parts if v),
+                    "offer_url": offer_url,
+                    "stock": str(offer.get("quantity")) if offer.get("quantity") is not None else None,
+                    "price": str(price_info.get("amount")) if price_info.get("amount") is not None else None,
+                    "currency": price_info.get("currency") or "USD",
+                    "min_order": (
+                        f"{min_quantity} {unit}".strip()
+                        if min_quantity is not None else None
+                    ),
+                    "delivery_time": delivery_text,
+                    "rating": rating,
+                    "unit": unit,
+                    "review_count": order_info.get("ratingCount"),
+                    "offer_id": offer_id or None,
+                    "platform": "eldorado",
+                })
+
+            if api_items:
+                print(
+                    f"  -> Eldorado API 返回 {len(api_items)} 条 "
+                    f"(价格使用 USD: {sum(i.get('currency') == 'USD' for i in api_items)} 条)"
+                )
+                return api_items
+    except Exception as e:
+        print(f"  [!] Eldorado API 数据解析失败，回退 DOM 解析: {e}")
+
+    # API 不可用时再加载页面，解析 #other-sellers 下的 .offer-row。
+    await page.set_extra_http_headers({
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    })
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    await asyncio.sleep(5)
+
+    # 等待 #other-sellers 容器及首批卡片出现
+    card_selector = "#other-sellers .offer-row"
+    for i in range(60):
+        cards = await page.query_selector_all(card_selector)
+        if cards:
+            print(f"  -> 检测到 {len(cards)} 个竞品卡片 ({i + 1}s)")
+            break
+        await asyncio.sleep(1)
+    else:
+        print("  [!] 超时：未找到 #other-sellers .offer-row")
+        return []
+
+    # 滚动加载，连续两轮数量不变才停止
+    previous_count = -1
+    stable_rounds = 0
+    for _ in range(10):
+        count = len(await page.query_selector_all(card_selector))
+        if count == previous_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+        if stable_rounds >= 2:
+            break
+        previous_count = count
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(2)
+
+    # 等待价格元素渲染完成（eld-offer-price 是异步组件）
+    for i in range(30):
+        price_count = await page.evaluate(
+            "() => document.querySelectorAll('strong[aria-label=\"amount-price\"]').length"
+        )
+        if price_count > 0:
+            print(f"  -> 价格元素已渲染，共 {price_count} 个 ({i + 1}s)")
+            break
+        await asyncio.sleep(1)
+    else:
+        # 价格还没出来，dump eld-offer-price 的原始 HTML 看看
+        eld_html = await page.evaluate("""
+            () => {
+                const el = document.querySelector('#other-sellers eld-offer-price');
+                return el ? el.outerHTML : 'eld-offer-price NOT FOUND';
+            }
+        """)
+        print(f"  [!] 价格元素未渲染，eld-offer-price HTML: {eld_html[:500]}")
+
+    items_raw = await page.evaluate("""
+        () => {
+            const rows = document.querySelectorAll('#other-sellers .offer-row');
+            const results = [];
+
+            rows.forEach(row => {
+                const item = {};
+
+                // ---- seller_id & seller_url ----
+                // href 形如 /users/SolidSales/shop/Currency
+                const sellerLink = row.querySelector('a[href*="/users/"]');
+                if (sellerLink) {
+                    item.seller_url = sellerLink.href;
+                    const m = sellerLink.getAttribute('href').match(/\\/users\\/([^\\/]+)/);
+                    if (m) item.seller_id = m[1];
+                }
+
+                // ---- seller_name：div.profile__username > a ----
+                const nameEl = row.querySelector('div[class*="profile__username"] a, div[class*="profile_username"] a');
+                if (nameEl) item.seller_name = nameEl.innerText.trim();
+
+                // ---- 好评率：.score 内紧跟 eld-icon 后面的 div（内容如 " 100% "）----
+                const scoreDiv = row.querySelector('.score');
+                if (scoreDiv) {
+                    // 找 score 下所有直接子 div（非 eld-icon 组件），取文本含 % 的
+                    for (const child of scoreDiv.children) {
+                        const t = child.innerText ? child.innerText.trim() : '';
+                        if (/^\\d+(\\.\\d+)?%$/.test(t)) {
+                            item.rating_raw = t;
+                            break;
+                        }
+                    }
+                }
+
+                // ---- 库存 / 最小起订 / 配送时间 ----
+                // 结构：<div class="desktop--md-2 detail">
+                //          <span class="label">In stock</span>
+                //          <div class="value"> 2,939,999 B </div>
+                //       </div>
+                row.querySelectorAll('.detail').forEach(d => {
+                    const labelEl = d.querySelector('span.label');
+                    const valueEl = d.querySelector('.value');
+                    if (!labelEl || !valueEl) return;
+                    const label = labelEl.innerText.trim();
+                    const value = valueEl.innerText.replace(/\\s+/g, ' ').trim();
+                    if (/^in stock$/i.test(label))     item.stock_raw = value;
+                    if (/^min\\.?\\s*qty/i.test(label)) item.min_order = value;
+                    if (/^delivery time$/i.test(label)) item.delivery_time = value;
+                });
+
+                // ---- 价格：strong[aria-label="amount-price"]，内容如 " $0.017 " ----
+                // eld-offer-price 是 Angular 组件，优先从 aria-label 取，回退取组件内第一个 strong
+                const priceEl = row.querySelector('strong[aria-label="amount-price"]')
+                    || row.querySelector('eld-offer-price strong')
+                    || row.querySelector('eld-offer-price .text-lg');
+                if (priceEl) {
+                    item.price_raw = priceEl.innerText.trim();
+                } else {
+                    // 最终兜底：从 eld-offer-price 的 innerText 用正则抠价格
+                    const offerPriceEl = row.querySelector('eld-offer-price');
+                    if (offerPriceEl) {
+                        const t = offerPriceEl.innerText.trim();
+                        const m = t.match(/[$€£¥]?\\s*[\\d.,]+/);
+                        if (m) item.price_raw = m[0].trim();
+                        item._price_source = 'innerText_fallback:' + t.substring(0, 50);
+                    }
+                }
+
+                // offer 链接暂无独立地址，用卖家页代替
+                item.offer_url = item.seller_url || null;
+
+                results.push(item);
+            });
+            return results;
+        }
+    """)
+
+    items = []
+    for raw in items_raw:
+        item = dict(raw)
+        item.pop("_debug", None)
+
+        # 价格 & 货币：price_raw 形如 "$0.017"，货币固定 USD
+        price_raw = raw.get("price_raw", "")
+        if raw.get("_price_source"):
+            print(f"  [price fallback] {raw['_price_source']}")
+        parsed_currency, parsed_price = parse_currency_from_price(price_raw)
+        item["price"] = parsed_price or price_raw
+        item["currency"] = parsed_currency or "USD"
+        item.pop("price_raw", None)
+        item.pop("_price_source", None)
+
+        # 好评率：去掉 % 保留两位小数
+        item["rating"] = parse_rating(raw.get("rating_raw", ""))
+        item.pop("rating_raw", None)
+
+        # 库存：去掉单位后缀（"2,939,999 B" → "2939999"）
+        stock_raw = raw.get("stock_raw", "")
+        stock_num_str = re.sub(r"[^0-9kmKM.]", "", stock_raw.replace(",", ""))
+        item["stock"] = stock_num_str or None
+        item.pop("stock_raw", None)
+
+        item["is_online"] = False
+        item["platform"] = "eldorado"
+
+        items.append(item)
+
+    return items
+
+
 async def run():
     # 读取目标
     targets = db.get_pending_targets()
@@ -494,6 +831,28 @@ async def run():
                 print(f"  [{idx+1}/{len(targets)}] 跳过: 无 URL")
                 continue
 
+            # 间隔时间检查：crawl_interval（分钟）* 60 + last_crawl_at 时间戳 > 当前时间戳则跳过
+            crawl_interval = target.get("crawl_interval")
+            last_crawl_at = target.get("last_crawl_at")
+            if crawl_interval and last_crawl_at:
+                try:
+                    interval_seconds = int(crawl_interval) * 60
+                    if hasattr(last_crawl_at, "timestamp"):
+                        last_ts = last_crawl_at.timestamp()
+                    else:
+                        from datetime import datetime as dt
+                        last_ts = dt.strptime(str(last_crawl_at), "%Y-%m-%d %H:%M:%S").timestamp()
+                    import time
+                    if last_ts + interval_seconds > time.time():
+                        remaining = int((last_ts + interval_seconds - time.time()) / 60)
+                        print(
+                            f"  [{idx+1}/{len(targets)}] {name} 跳过: "
+                            f"未到间隔时间，还需等待约 {remaining} 分钟"
+                        )
+                        continue
+                except Exception as e:
+                    print(f"  [{idx+1}/{len(targets)}] 间隔时间解析异常: {e}，继续执行")
+
             platform = "eldorado" if "eldorado.gg" in url else "g2g"
             category_label = category or "未设置类别"
             print(
@@ -508,8 +867,39 @@ async def run():
                 version = db.increment_version(target_id)
                 print(f"  -> version={version}")
 
-                # "金币"和"游戏币"都是 /offer/group 分类页，使用 #pcOtherOffer 竞品商户卡片。
-                if category in {"金币", "游戏币"}:
+                # 按 category 分流到不同爬取函数
+                if category == "ELD游戏币":
+                    # Eldorado 反爬较强，单独创建干净的 context，不带 G2G cookie
+                    eld_context = await browser.new_context(
+                        viewport=config.VIEWPORT,
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"
+                        ),
+                        locale="en-US",
+                        timezone_id="America/New_York",
+                        extra_http_headers={
+                            "Accept-Language": "en-US,en;q=0.9",
+                        },
+                    )
+                    await eld_context.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                        Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+                        const origQuery = window.navigator.permissions.query;
+                        window.navigator.permissions.query = (p) =>
+                            p.name === 'notifications'
+                                ? Promise.resolve({ state: Notification.permission })
+                                : origQuery(p);
+                    """)
+                    eld_page = await eld_context.new_page()
+                    try:
+                        items = await scrape_eldorado_page(eld_page, url)
+                    finally:
+                        await eld_context.close()
+                elif category in {"金币", "游戏币"}:
                     items = await scrape_other_offer_page(page, url)
                 else:
                     items = await scrape_page(page, url)
