@@ -18,3 +18,4 @@ debug_*.png
 # IDE
 .vscode/
 .idea/
+logs/
