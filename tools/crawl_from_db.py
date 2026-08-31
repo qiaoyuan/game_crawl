@@ -451,26 +451,36 @@ async def scrape_eldorado_page(page, url: str) -> list:
     print(f"  [*] 打开 Eldorado 页面: {url}")
 
     # 从商品页 URL 构造官方 offers API。
-    # /g/132-0-0 中 132=gameId、0=Currency；te_v0 对应 tradeEnvironmentValue0。
+    # 路径两种形式：/g/132-0-0（132=gameId，0=Currency）和 /g/220（只有 gameId）。
+    # te_v0 对应 tradeEnvironmentValue0；其余未知 query 是属性筛选，需原样透传，
+    # 例如 path-of-exile-2-orbs=mirror-of-kalandra。
     parsed_url = urlparse(url)
-    legacy_match = re.search(r"/g/(\d+)-(\d+)-(\d+)", parsed_url.path)
+    legacy_match = re.search(r"/g/(\d+)(?:-(\d+)-(\d+))?", parsed_url.path)
     api_response = None
     if legacy_match:
         category_map = {"0": "Currency", "1": "Account", "2": "CustomItem"}
         query = parse_qs(parsed_url.query)
         params = [
             ("gameId", legacy_match.group(1)),
-            ("category", category_map.get(legacy_match.group(2), "Currency")),
+            ("category", category_map.get(legacy_match.group(2) or "0", "Currency")),
         ]
+        # 属性筛选参数：除 te_v* 和 offerSortingCriterion 外全部透传，
+        # 否则会抓成该游戏的全量报价而不是当前筛选的道具。
+        passthrough = []
         for key, values in sorted(query.items()):
+            if not values:
+                continue
             env_match = re.fullmatch(r"te_v(\d+)", key)
-            if env_match and values:
+            if env_match:
                 params.append((f"tradeEnvironmentValue{env_match.group(1)}", values[0]))
+            elif key != "offerSortingCriterion":
+                passthrough.append((key, values[0]))
         params.extend([
             ("pageIndex", "1"),
             ("pageSize", "150"),
             ("offerSortingCriterion", query.get("offerSortingCriterion", ["Cheapest"])[0]),
         ])
+        params.extend(passthrough)
         api_url = (
             "https://www.eldorado.gg/api/predefinedOffers/augmentedGame/offers?"
             + urlencode(params)
@@ -539,12 +549,25 @@ async def scrape_eldorado_page(page, url: str) -> list:
                 order_info = record.get("userOrderInfo") or {}
                 delivery = record.get("deliveryTime") or {}
 
-                # 始终优先保存官方 USD 单价，避免页面按 IP 显示 SGD。
-                price_info = (
-                    offer.get("pricePerUnitInUSD")
-                    or offer.get("pricePerUnit")
-                    or {}
-                )
+                # 价格统一按 USD 入库。优先用接口的 pricePerUnitInUSD；
+                # 若缺失则用 exchangeRate（该字段是「1 USD = N 展示货币」）换算回 USD。
+                price_info = offer.get("pricePerUnitInUSD") or {}
+                if price_info.get("amount") is None:
+                    local_price = offer.get("pricePerUnit") or {}
+                    local_amount = local_price.get("amount")
+                    rate = (offer.get("exchangeRate") or {}).get("exchangeRate")
+                    if local_amount is not None and str(local_price.get("currency")) == "USD":
+                        price_info = {"amount": local_amount, "currency": "USD"}
+                    elif local_amount is not None and rate:
+                        try:
+                            price_info = {
+                                "amount": round(float(local_amount) / float(rate), 8),
+                                "currency": "USD",
+                            }
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            price_info = {}
+                    else:
+                        price_info = {}
                 unit = unit_label(offer.get("unitSystem"))
                 username = str(user.get("username") or "").strip()
                 offer_id = str(offer.get("id") or "").strip()
@@ -595,7 +618,7 @@ async def scrape_eldorado_page(page, url: str) -> list:
                     "offer_url": offer_url,
                     "stock": str(offer.get("quantity")) if offer.get("quantity") is not None else None,
                     "price": str(price_info.get("amount")) if price_info.get("amount") is not None else None,
-                    "currency": price_info.get("currency") or "USD",
+                    "currency": "USD",
                     "min_order": (
                         f"{min_quantity} {unit}".strip()
                         if min_quantity is not None else None
@@ -883,6 +906,22 @@ async def run():
                             "Accept-Language": "en-US,en;q=0.9",
                         },
                     )
+                    # 强制 USD + 英文：Eldorado 按 IP 自动切货币（如服务器在新加坡会变 SGD），
+                    # 注入货币偏好 cookie 让页面与接口都返回 USD。
+                    await eld_context.add_cookies([
+                        {
+                            "name": "eldoradogg_currencyPreference",
+                            "value": "USD",
+                            "domain": "www.eldorado.gg",
+                            "path": "/",
+                        },
+                        {
+                            "name": "eldoradogg_locale",
+                            "value": "en-US",
+                            "domain": "www.eldorado.gg",
+                            "path": "/",
+                        },
+                    ])
                     await eld_context.add_init_script("""
                         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
