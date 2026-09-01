@@ -187,7 +187,7 @@ def parse_price(text: str | None) -> float | None:
 #       改价不在 Python 做。
 
 
-def insert_crawl_notify(target_id: int, crawled_count: int):
+def insert_crawl_notify(target_id: int, version: int, crawled_count: int):
     """爬完一个目标写一条通知，交给 PHP 消费执行改价策略"""
     conn = get_connection()
     try:
@@ -195,10 +195,10 @@ def insert_crawl_notify(target_id: int, crawled_count: int):
             cur.execute(
                 """
                 INSERT INTO crawl_notify
-                    (crawl_target_id, crawled_count, status, crawled_at, created_at, updated_at)
-                VALUES (%s, %s, 0, NOW(), NOW(), NOW())
+                    (crawl_target_id, version, crawled_count, status, crawled_at, created_at, updated_at)
+                VALUES (%s, %s, %s, 0, NOW(), NOW(), NOW())
                 """,
-                (target_id, crawled_count),
+                (target_id, version, crawled_count),
             )
         conn.commit()
     finally:

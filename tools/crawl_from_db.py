@@ -956,7 +956,7 @@ async def run():
 
                 db.update_last_crawl(target_id)
                 # 发信号通知 PHP：该目标已爬完，由 PHP 消费通知后执行改价策略
-                db.insert_crawl_notify(target_id, inserted)
+                db.insert_crawl_notify(target_id, version, inserted)
                 print(f"  -> 已写入爬取完成通知(crawl_notify)")
             except Exception as e:
                 print(f"  -> 错误: {e}")
