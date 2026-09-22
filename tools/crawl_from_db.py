@@ -859,13 +859,13 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                 print(f"  [{idx+1}/{len(targets)}] 跳过: 无 URL")
                 continue
 
-            # 到期时间 = 上次爬取完成时间 + 30 秒 + crawl_interval（秒）。
-            # 未配置或配置为 0 时，仍保留基础 30 秒间隔；首次爬取不等待。
+            # 到期时间 = 上次爬取完成时间 + crawl_interval（秒，如 1 分钟为 60）。
+            # 未配置或配置为 0 时不限制间隔；首次爬取不等待。
             crawl_interval = target.get("crawl_interval")
             last_crawl_at = target.get("last_crawl_at")
             if last_crawl_at:
                 try:
-                    interval_seconds = 30 + max(0, int(crawl_interval or 0))
+                    interval_seconds = max(0, int(crawl_interval or 0))
                     if hasattr(last_crawl_at, "timestamp"):
                         last_ts = last_crawl_at.timestamp()
                     else:
