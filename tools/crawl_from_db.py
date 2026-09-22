@@ -8,6 +8,7 @@
 import argparse
 import asyncio
 import json
+import math
 import re
 from playwright.async_api import async_playwright
 from g2g import config, db
@@ -858,23 +859,24 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                 print(f"  [{idx+1}/{len(targets)}] 跳过: 无 URL")
                 continue
 
-            # 间隔时间检查：crawl_interval（分钟）* 60 + last_crawl_at 时间戳 > 当前时间戳则跳过
+            # 到期时间 = 上次爬取完成时间 + 30 秒 + crawl_interval（秒）。
+            # 未配置或配置为 0 时，仍保留基础 30 秒间隔；首次爬取不等待。
             crawl_interval = target.get("crawl_interval")
             last_crawl_at = target.get("last_crawl_at")
-            if crawl_interval and last_crawl_at:
+            if last_crawl_at:
                 try:
-                    interval_seconds = int(crawl_interval) * 60
+                    interval_seconds = 30 + max(0, int(crawl_interval or 0))
                     if hasattr(last_crawl_at, "timestamp"):
                         last_ts = last_crawl_at.timestamp()
                     else:
                         from datetime import datetime as dt
                         last_ts = dt.strptime(str(last_crawl_at), "%Y-%m-%d %H:%M:%S").timestamp()
                     import time
-                    if last_ts + interval_seconds > time.time():
-                        remaining = int((last_ts + interval_seconds - time.time()) / 60)
+                    remaining = math.ceil(last_ts + interval_seconds - time.time())
+                    if remaining > 0:
                         print(
                             f"  [{idx+1}/{len(targets)}] {name} 跳过: "
-                            f"未到间隔时间，还需等待约 {remaining} 分钟"
+                            f"未到间隔时间，还需等待约 {remaining} 秒（总间隔 {interval_seconds} 秒）"
                         )
                         continue
                 except Exception as e:
