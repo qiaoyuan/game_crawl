@@ -1,8 +1,11 @@
 """
 从数据库 crawl_target 表读取 URL 列表，批量爬取并保存到 crawl_data 表
 用法: python -m tools.crawl_from_db
+双进程: bash run_crawl_and_consume.sh（生产环境）
+单个分片: python -m tools.crawl_from_db --worker-count 2 --worker-index 0
 """
 
+import argparse
 import asyncio
 import json
 import re
@@ -804,14 +807,14 @@ async def scrape_eldorado_page(page, url: str) -> list:
     return items
 
 
-async def run():
+async def run(worker_index: int = 0, worker_count: int = 1):
     # 读取目标
-    targets = db.get_pending_targets()
-    print(f"[*] 从数据库读取到 {len(targets)} 个爬取目标")
+    targets = db.get_pending_targets(worker_index, worker_count)
+    print(f"[*] worker {worker_index + 1}/{worker_count}: 从数据库读取到 {len(targets)} 个爬取目标")
 
     if not targets:
-        print("[!] crawl_target 表为空")
-        return
+        print("[*] 当前分片没有爬取目标")
+        return 0
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(**config.browser_launch_kwargs())
@@ -833,6 +836,7 @@ async def run():
         page = await context.new_page()
 
         total_saved = 0
+        failed_count = 0
         for idx, target in enumerate(targets):
             target_id = target.get("id")
             try:
@@ -959,11 +963,26 @@ async def run():
                 db.insert_crawl_notify(target_id, version, inserted)
                 print(f"  -> 已写入爬取完成通知(crawl_notify)")
             except Exception as e:
+                failed_count += 1
                 print(f"  -> 错误: {e}")
 
         await browser.close()
-        print(f"\n[✓] 全部完成! 共保存 {total_saved} 条数据")
+        print(f"\n[*] 分片完成! 共保存 {total_saved} 条数据，失败 {failed_count} 个目标")
+        return 1 if failed_count else 0
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="从数据库分片爬取目标")
+    parser.add_argument("--worker-count", type=int, default=1, help="总进程数，默认 1")
+    parser.add_argument("--worker-index", type=int, default=0, help="当前进程编号，从 0 开始")
+    args = parser.parse_args(argv)
+    if args.worker_count < 1:
+        parser.error("--worker-count 必须大于 0")
+    if not 0 <= args.worker_index < args.worker_count:
+        parser.error("--worker-index 必须在 [0, worker-count) 内")
+    return args
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    args = parse_args()
+    raise SystemExit(asyncio.run(run(args.worker_index, args.worker_count)))

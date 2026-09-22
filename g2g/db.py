@@ -18,13 +18,18 @@ def get_connection():
     )
 
 
-def get_pending_targets() -> list:
-    """获取待爬取的目标 URL 列表（status=1 且未删除）"""
+def get_pending_targets(worker_index: int = 0, worker_count: int = 1) -> list:
+    """按目标 ID 分片获取待爬取列表，worker_index 从 0 开始。"""
+    if worker_count < 1 or not 0 <= worker_index < worker_count:
+        raise ValueError("worker_count 必须为正数，worker_index 必须在 [0, worker_count) 内")
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM crawl_target WHERE status = 1 AND deleted_at IS NULL"
+                "SELECT * FROM crawl_target "
+                "WHERE status = 1 AND deleted_at IS NULL "
+                "AND MOD(id, %s) = %s ORDER BY id",
+                (worker_count, worker_index),
             )
             return cur.fetchall()
     finally:

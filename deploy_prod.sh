@@ -67,9 +67,11 @@ echo ">>> [5/5] 部署完成"
 cat << 'HELP'
 
 部署完成！后续使用：
-  1) 手动测试:  ssh root@43.106.27.46 "cd /www/wwwroot/game_crawl && source venv/bin/activate && python -m tools.crawl_from_db"
+  1) 手动运行（双进程）: ssh root@43.106.27.46 "bash /www/wwwroot/game_crawl/run_crawl_and_consume.sh"
   2) 定时任务（宝塔计划任务 或 crontab -e）:
-     */10 * * * * cd /www/wwwroot/game_crawl && /www/wwwroot/game_crawl/venv/bin/python -m tools.crawl_from_db >> /www/wwwroot/game_crawl/logs/crawl.log 2>&1
+     */10 * * * * /bin/bash /www/wwwroot/game_crawl/run_crawl_and_consume.sh
+
+  汇总日志: logs/crawl.log；分片日志: logs/crawl_worker_0.log、logs/crawl_worker_1.log
 
 提示：脚本会多次要求输入 SSH 密码。推荐先配置免密登录:
   ssh-copy-id root@43.106.27.46
