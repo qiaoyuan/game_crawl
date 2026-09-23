@@ -62,11 +62,8 @@ class CrawlWorkerTests(unittest.TestCase):
         for first_exit in (0, 7):
             with self.subTest(first_exit=first_exit), tempfile.TemporaryDirectory() as directory:
                 script = launcher.replace("/www/wwwroot/game_crawl", directory)
-                script = script.replace("/tmp/game_crawl.lock", f"{directory}/crawl.lock")
-                script = script.replace("/usr/bin/flock", "fake_flock")
                 script = script.replace("/usr/bin/xvfb-run", "fake_worker")
                 prelude = f'''
-fake_flock() {{ return 0; }}
 fake_worker() {{
     local index="${{!#}}"
     echo "start $index" >> "{directory}/events"

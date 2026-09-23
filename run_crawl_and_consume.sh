@@ -1,7 +1,5 @@
 #!/bin/bash
 
-LOCK_FILE="/tmp/game_crawl.lock"
-
 LOG_DIR="/www/wwwroot/game_crawl/logs"
 LOG_FILE="$LOG_DIR/crawl.log"
 WORKER_COUNT=2
@@ -12,16 +10,7 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
 }
 
-# 整个脚本流程共用同一把锁
-exec 9>"$LOCK_FILE"
-if ! /usr/bin/flock -n 9; then
-    log "[WARN] 上一轮竞品任务仍在执行，跳过本轮，避免重复启动爬取进程"
-    exit 0
-fi
-
-# 两个 worker 继承锁描述符。意外退出时也要等存活的 worker 退出后释放锁。
-trap 'exec 9>&-' EXIT
-
+# 执行频率由宝塔控制；每次触发均启动本轮两个 worker。
 log "开始执行爬虫任务，进程数: $WORKER_COUNT"
 
 cd /www/wwwroot/game_crawl || {
@@ -46,7 +35,7 @@ for ((worker_index=0; worker_index<WORKER_COUNT; worker_index++)); do
     log "启动 worker=${worker_index}，PID=$!，日志: $worker_log"
 done
 
-# 即使一个 worker 失败，也必须等待另一个结束，避免下一轮重叠。
+# 即使一个 worker 失败，也等待本轮另一个结束，再汇总退出状态。
 crawl_exit=0
 for ((worker_index=0; worker_index<WORKER_COUNT; worker_index++)); do
     wait "${worker_pids[$worker_index]}"
