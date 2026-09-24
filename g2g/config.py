@@ -42,6 +42,12 @@ DB_USER = os.environ.get("DB_USER", "root")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 DB_NAME = os.environ.get("DB_NAME", "game_platform")
 
+# 每台爬虫只领取属于本机的任务；未配置时归属服务器 1。
+_crawl_server = os.environ.get("crawl_server", "1").strip()
+if _crawl_server not in ("1", "2"):
+    raise ValueError("crawl_server 必须为 1 或 2")
+CRAWL_SERVER = int(_crawl_server)
+
 # 浏览器
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

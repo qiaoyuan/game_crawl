@@ -811,7 +811,10 @@ async def scrape_eldorado_page(page, url: str) -> list:
 async def run(worker_index: int = 0, worker_count: int = 1):
     # 读取目标
     targets = db.get_pending_targets(worker_index, worker_count)
-    print(f"[*] worker {worker_index + 1}/{worker_count}: 从数据库读取到 {len(targets)} 个爬取目标")
+    print(
+        f"[*] crawl_server={config.CRAWL_SERVER}, worker {worker_index + 1}/{worker_count}: "
+        f"从数据库读取到 {len(targets)} 个爬取目标"
+    )
 
     if not targets:
         print("[*] 当前分片没有爬取目标")

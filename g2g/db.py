@@ -19,7 +19,7 @@ def get_connection():
 
 
 def get_pending_targets(worker_index: int = 0, worker_count: int = 1) -> list:
-    """按目标 ID 分片获取待爬取列表，worker_index 从 0 开始。"""
+    """只领取本机 crawl_server 的目标，再按 ID 分片；worker_index 从 0 开始。"""
     if worker_count < 1 or not 0 <= worker_index < worker_count:
         raise ValueError("worker_count 必须为正数，worker_index 必须在 [0, worker_count) 内")
     conn = get_connection()
@@ -28,8 +28,8 @@ def get_pending_targets(worker_index: int = 0, worker_count: int = 1) -> list:
             cur.execute(
                 "SELECT * FROM crawl_target "
                 "WHERE status = 1 AND deleted_at IS NULL "
-                "AND MOD(id, %s) = %s ORDER BY id",
-                (worker_count, worker_index),
+                "AND crawl_server = %s AND MOD(id, %s) = %s ORDER BY id",
+                (config.CRAWL_SERVER, worker_count, worker_index),
             )
             return cur.fetchall()
     finally:

@@ -8,31 +8,37 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from g2g import db
+from g2g import config, db
 from tools import crawl_from_db
 
 
 class CrawlWorkerTests(unittest.TestCase):
     def test_shards_cover_active_targets_once(self):
         with sqlite3.connect(":memory:") as database:
-            database.execute("CREATE TABLE crawl_target (id INTEGER, status INTEGER, deleted_at TEXT)")
-            database.executemany(
-                "INSERT INTO crawl_target VALUES (?, ?, ?)",
-                [(1, 1, None), (2, 1, None), (5, 1, None), (8, 1, None),
-                 (9, 0, None), (10, 1, "deleted")],
+            database.execute(
+                "CREATE TABLE crawl_target "
+                "(id INTEGER, status INTEGER, deleted_at TEXT, crawl_server INTEGER)"
             )
-            shards = []
-            for index in range(2):
-                connection = MagicMock()
-                cursor = connection.cursor.return_value.__enter__.return_value
-                with patch.object(db, "get_connection", return_value=connection):
-                    db.get_pending_targets(index, 2)
-                sql, params = cursor.execute.call_args.args
-                rows = database.execute(sql.replace("%s", "?"), params).fetchall()
-                shards.append({row[0] for row in rows})
-                connection.close.assert_called_once()
-            self.assertEqual(shards[0] | shards[1], {1, 2, 5, 8})
-            self.assertFalse(shards[0] & shards[1])
+            database.executemany(
+                "INSERT INTO crawl_target VALUES (?, ?, ?, ?)",
+                [(1, 1, None, 1), (2, 1, None, 1), (5, 1, None, 1),
+                 (8, 1, None, 1), (9, 0, None, 1), (10, 1, "deleted", 1),
+                 (11, 1, None, 2), (12, 1, None, 2)],
+            )
+            for server, expected in [(1, {1, 2, 5, 8}), (2, {11, 12})]:
+                with self.subTest(server=server), patch.object(config, "CRAWL_SERVER", server):
+                    shards = []
+                    for index in range(2):
+                        connection = MagicMock()
+                        cursor = connection.cursor.return_value.__enter__.return_value
+                        with patch.object(db, "get_connection", return_value=connection):
+                            db.get_pending_targets(index, 2)
+                        sql, params = cursor.execute.call_args.args
+                        rows = database.execute(sql.replace("%s", "?"), params).fetchall()
+                        shards.append({row[0] for row in rows})
+                        connection.close.assert_called_once()
+                    self.assertEqual(shards[0] | shards[1], expected)
+                    self.assertFalse(shards[0] & shards[1])
 
     def test_invalid_shard_rejected_before_database_access(self):
         for index, count in [(0, 0), (-1, 2), (2, 2)]:
