@@ -22,7 +22,9 @@ crawl_started_at=$SECONDS
 worker_pids=()
 for ((worker_index=0; worker_index<WORKER_COUNT; worker_index++)); do
     worker_log="$LOG_DIR/crawl_worker_${worker_index}.log"
-    /usr/bin/xvfb-run -a -s "-screen 0 1280x800x24" \
+    display_number=$((90 + worker_index))
+    xvfb_log="$LOG_DIR/xvfb_worker_${worker_index}.log"
+    /usr/bin/xvfb-run -n "$display_number" -e "$xvfb_log" -s "-screen 0 1280x800x24" \
     /usr/bin/env \
     APP_ENV=prod \
     BROWSER_CHANNEL="" \
@@ -32,7 +34,7 @@ for ((worker_index=0; worker_index<WORKER_COUNT; worker_index++)); do
     --worker-count "$WORKER_COUNT" --worker-index "$worker_index" \
     >> "$worker_log" 2>&1 &
     worker_pids+=("$!")
-    log "启动 worker=${worker_index}，PID=$!，日志: $worker_log"
+    log "启动 worker=${worker_index}，DISPLAY=:${display_number}，PID=$!，日志: ${worker_log}，Xvfb日志: ${xvfb_log}"
 done
 
 # 即使一个 worker 失败，也等待本轮另一个结束，再汇总退出状态。

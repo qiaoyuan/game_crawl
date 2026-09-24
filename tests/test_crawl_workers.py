@@ -72,7 +72,12 @@ class CrawlWorkerTests(unittest.TestCase):
                 prelude = f'''
 fake_worker() {{
     local index="${{!#}}"
-    echo "start $index" >> "{directory}/events"
+    local display=""
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = "-n" ]; then display="$2"; break; fi
+        shift
+    done
+    echo "start $index display=$display" >> "{directory}/events"
     if [ "$index" = 0 ]; then sleep 0.2; else sleep 0.6; fi
     echo "done $index" >> "{directory}/events"
     if [ "$index" = 0 ]; then return {first_exit}; fi
@@ -83,7 +88,7 @@ fake_worker() {{
                                         capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, first_exit, result.stderr)
                 events = (Path(directory) / "events").read_text().splitlines()
-                self.assertEqual(set(events[:2]), {"start 0", "start 1"})
+                self.assertEqual(set(events[:2]), {"start 0 display=90", "start 1 display=91"})
                 self.assertEqual(events[2:], ["done 0", "done 1"])
                 log = (Path(directory) / "logs/crawl.log").read_text()
                 self.assertIn("worker=1 完成，退出码: 0", log)
