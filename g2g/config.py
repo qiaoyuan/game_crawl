@@ -48,10 +48,13 @@ if _crawl_server not in ("1", "2"):
     raise ValueError("crawl_server 必须为 1 或 2")
 CRAWL_SERVER = int(_crawl_server)
 
-# G2G 金币/游戏币页面按当前展示顺序，仅抓取前 N 条竞品。
-CRAWL_OFFER_LIMIT = int(os.environ.get("CRAWL_OFFER_LIMIT", "10"))
+# G2G 页面按当前展示顺序，仅抓取前 N 条竞品，默认 8 条。
+CRAWL_OFFER_LIMIT = int(os.environ.get("CRAWL_OFFER_LIMIT", "8"))
 if CRAWL_OFFER_LIMIT < 1:
     raise ValueError("CRAWL_OFFER_LIMIT 必须为正整数")
+
+# Eldorado 网页第一页为 8 条，API 与 DOM 兜底保持同一范围。
+ELD_OFFER_PAGE_SIZE = 8
 
 # 浏览器
 USER_AGENT = (

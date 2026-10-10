@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import async_playwright
 
+from g2g.crawl_filter import compile_policies
+
 from tools.crawl_from_db import parse_detail_unit_price, refresh_other_offer_prices
 from tools import crawl_from_db
 
@@ -70,7 +72,7 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(row["unit_price"] == row["price"] for row in rows))
         self.assertEqual(len(result), 4)
 
-    async def test_page_only_extracts_first_ten_before_enhancement_without_extra_loading(self):
+    async def test_page_only_extracts_first_eight_before_enhancement_without_extra_loading(self):
         await self.page.evaluate("""() => {
             const container = document.querySelector('#pcOtherOffer');
             container.innerHTML = '';
@@ -85,7 +87,7 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
         for refresh in (False, True):
             with self.subTest(refresh=refresh), \
                  patch.object(self.page, "goto", new=AsyncMock()), \
-                 patch.object(crawl_from_db.config, "CRAWL_OFFER_LIMIT", 10), \
+                 patch.object(crawl_from_db.config, "CRAWL_OFFER_LIMIT", 8), \
                  patch.object(crawl_from_db, "asyncio", SimpleNamespace(sleep=AsyncMock())) as async_stub, \
                  patch.object(crawl_from_db, "refresh_other_offer_prices", new=AsyncMock()) as detail:
                 rows = await crawl_from_db.scrape_other_offer_page(
@@ -96,8 +98,47 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     detail.assert_not_awaited()
                 self.assertEqual([row["seller_id"] for row in rows],
-                                 [f"seller{i}" for i in range(10)])
+                                 [f"seller{i}" for i in range(8)])
                 async_stub.sleep.assert_not_awaited()
+
+    async def test_generic_g2g_cards_also_only_keep_first_eight(self):
+        await self.page.evaluate("""() => {
+            for (let i = 0; i < 20; i++) {
+                const card = document.createElement('div');
+                card.setAttribute('aria-label', 'Product Card');
+                card.innerHTML = `<a href="https://www.g2g.com/itemSeller${i}">itemSeller${i}</a>`;
+                document.body.append(card);
+            }
+        }""")
+        html = await self.page.content()
+        await self.page.route("http://fixture.test/**", lambda route: route.fulfill(body=html, content_type="text/html"))
+        with patch.object(crawl_from_db.config, "CRAWL_OFFER_LIMIT", 8), \
+             patch.object(crawl_from_db, "asyncio", SimpleNamespace(sleep=AsyncMock())), \
+             patch.object(self.page, "evaluate", wraps=self.page.evaluate) as evaluate:
+            rows = await crawl_from_db.scrape_page(self.page, "http://fixture.test/")
+            self.assertEqual(len(rows), 8)
+            self.assertEqual([row["seller_id"] for row in rows], [f"itemSeller{i}" for i in range(8)])
+            self.assertFalse(any("scrollTo" in call.args[0] for call in evaluate.await_args_list))
+
+    async def test_eldorado_dom_only_keeps_first_eight_without_scroll_or_pagination(self):
+        await self.page.evaluate("""() => {
+            const container = document.createElement('div');
+            container.id = 'other-sellers';
+            for (let i = 0; i < 20; i++) {
+                const row = document.createElement('div');
+                row.className = 'offer-row';
+                row.innerHTML = `<a href="https://www.eldorado.gg/users/eld${i}/shop/Currency">eld${i}</a>
+                    <strong aria-label="amount-price">$${i+1}</strong>`;
+                container.append(row);
+            }
+            document.body.append(container);
+        }""")
+        with patch.object(self.page, "goto", new=AsyncMock()), \
+             patch.object(crawl_from_db, "asyncio", SimpleNamespace(sleep=AsyncMock())), \
+             patch.object(self.page, "evaluate", wraps=self.page.evaluate) as evaluate:
+            rows = await crawl_from_db.scrape_eldorado_page(self.page, "https://www.eldorado.gg/fixture")
+            self.assertEqual([row["seller_id"] for row in rows], [f"eld{i}" for i in range(8)])
+            self.assertFalse(any("scrollTo" in call.args[0] for call in evaluate.await_args_list))
 
     async def test_stale_portal_for_new_seller_times_out_instead_of_using_old_price(self):
         await self.page.evaluate("""() => {
@@ -125,6 +166,40 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0]["currency"], "USD")
         self.assertNotIn("unit_price_source", result[2])
         self.assertNotIn("unit_price_source", result[3])
+
+    async def test_empty_names_refresh_strategy_top3_but_keep_every_row(self):
+        rows = [{"seller_id": seller, "price": str(index + 1), "currency": "USD",
+                 "stock": "100", "rating": "99"} for index, seller in enumerate("abcd")]
+        policies = compile_policies([{"config": {"blacklist_stores": ["a"],
+                                                  "min_stock": 50, "min_rating": 90},
+                                      "currency": "USD"}])
+        result = await refresh_other_offer_prices(self.page, rows, timeout_ms=2000,
+                                                enhance_stores="", policies=policies)
+        self.assertIs(result, rows)
+        self.assertEqual(len(result), 4)
+        self.assertEqual(await self.page.evaluate("window.clicks"), list("bcd"))
+        self.assertEqual(rows[0]["price"], "1")
+        self.assertNotIn("unit_price_source", rows[0])
+
+    async def test_nonempty_names_override_strategy_selection(self):
+        rows = [{"seller_id": seller, "price": str(index + 1), "currency": "USD"}
+                for index, seller in enumerate("abcd")]
+        policies = compile_policies([{"config": {"blacklist_stores": ["a"]}, "currency": "USD"}])
+        result = await refresh_other_offer_prices(self.page, rows, timeout_ms=2000,
+                                                enhance_stores="a", policies=policies)
+        self.assertEqual(await self.page.evaluate("window.clicks"), ["a"])
+        self.assertEqual(len(result), 4)
+
+    async def test_empty_names_multiple_strategies_refresh_deduplicated_union(self):
+        rows = [{"seller_id": seller, "price": str(index + 1), "currency": "USD"}
+                for index, seller in enumerate("abcd")]
+        policies = compile_policies([
+            {"config": {"blacklist_stores": ["a"]}, "currency": "USD"},
+            {"config": {"blacklist_stores": ["d"]}, "currency": "USD"},
+        ])
+        await refresh_other_offer_prices(self.page, rows, timeout_ms=2000,
+                                        enhance_stores="", policies=policies)
+        self.assertEqual(await self.page.evaluate("window.clicks"), list("abcd"))
 
     async def test_empty_or_unmatched_names_keep_all_rows_without_detail_requests(self):
         rows = [{"seller_id": "a", "stock": "0", "rating": "99"}]

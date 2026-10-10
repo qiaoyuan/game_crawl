@@ -139,7 +139,7 @@ class CrawlFilterTests(unittest.TestCase):
                 target = {"id": 10, "game_product_id": 1, "url": "https://example.com",
                           "category": "游戏币", "crawl_type": crawl_type, "enhance_stores": stores}
                 with patch.object(db, "get_pending_targets", return_value=[target]), \
-                     patch.object(db, "get_crawl_strategies", side_effect=AssertionError("不应读取改价策略")) as load, \
+                     patch.object(db, "get_crawl_strategies", return_value=[{"config": {}, "currency": "USD"}]) as load, \
                      patch.object(db, "increment_version", return_value=8) as increment, \
                      patch.object(db, "save_crawl_data", return_value=len(expected or [])) as save, \
                      patch.object(db, "update_last_crawl") as update, \
@@ -147,7 +147,10 @@ class CrawlFilterTests(unittest.TestCase):
                      patch.object(crawl_from_db, "async_playwright", return_value=manager), \
                      patch.object(crawl_from_db, "scrape_other_offer_page", new=AsyncMock(return_value=rows)) as scrape:
                     asyncio.run(crawl_from_db.run())
-                    load.assert_not_called()
+                    if crawl_type == 1 and not stores:
+                        load.assert_called_once_with(10)
+                    else:
+                        load.assert_not_called()
                     if expected is None:
                         save.assert_not_called()
                         increment.assert_not_called()
@@ -160,7 +163,8 @@ class CrawlFilterTests(unittest.TestCase):
                         else:
                             scrape.assert_awaited_once_with(context.new_page.return_value, target["url"],
                                                            refresh_unit_prices=True,
-                                                           enhance_stores=stores)
+                                                           enhance_stores=stores,
+                                                           policies=compile_policies(load.return_value) if not stores else None)
                         save.assert_called_once_with(10, "g2g", expected, game_product_id=1, version=8)
                         notify.assert_called_once_with(10, 8, len(expected))
                         update.assert_called_once_with(10)

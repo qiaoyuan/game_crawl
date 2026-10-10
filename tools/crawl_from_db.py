@@ -13,7 +13,7 @@ import re
 from time import perf_counter
 from playwright.async_api import async_playwright
 from g2g import config, db
-from g2g.crawl_filter import identifiers, number
+from g2g.crawl_filter import compile_policies, identifiers, number, select_top3
 
 # 货币符号 → 货币代码映射（页面实际显示的货币）
 CURRENCY_SYMBOL_MAP = {
@@ -83,6 +83,7 @@ def parse_rating(text: str | None) -> str | None:
 
 async def scrape_page(page, url: str) -> list:
     """爬取单个页面的产品卡片"""
+    offer_limit = config.CRAWL_OFFER_LIMIT
     print(f"  [*] 打开: {url}")
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
@@ -113,6 +114,8 @@ async def scrape_page(page, url: str) -> list:
     prev_count = 0
     for s in range(10):
         count = len(await page.query_selector_all('[aria-label="Product Card"]'))
+        if count >= offer_limit:
+            break
         if count == prev_count:
             break
         prev_count = count
@@ -146,12 +149,12 @@ async def scrape_page(page, url: str) -> list:
 
     # 提取数据
     items_raw = await page.evaluate("""
-        (() => {
+        limit => {
             const VALID_CURRENCY_CODES = new Set([
                 'USD','SGD','EUR','GBP','AUD','CAD','JPY','CNY','HKD','MYR','KRW','INR','THB','PHP','IDR','CHF','NZD','BRL','SEK','NOK','DKK','PLN','AED','SAR'
             ]);
 
-            const cards = document.querySelectorAll('[aria-label="Product Card"]');
+            const cards = Array.from(document.querySelectorAll('[aria-label="Product Card"]')).slice(0, limit);
             const results = [];
             cards.forEach(card => {
                 const item = {};
@@ -243,8 +246,8 @@ async def scrape_page(page, url: str) -> list:
                 results.push(item);
             });
             return results;
-        })()
-    """)
+        }
+    """, offer_limit)
 
     # ========== Python 侧货币解析：优先从页面实际内容提取 ==========
     items = []
@@ -324,12 +327,16 @@ def parse_detail_unit_price(text):
     return match[1].replace(",", ""), match[2].upper()
 
 
-async def refresh_other_offer_prices(page, items, timeout_ms=15000, enhance_stores=None):
+async def refresh_other_offer_prices(page, items, timeout_ms=15000, enhance_stores=None, policies=None):
     """逐店查看详情；任何单价未确认时中止目标，避免用旧价生成改价通知。"""
     stores = identifiers(enhance_stores)
-    candidates = [item for item in items if stores & identifiers(
-        [item.get("seller_id"), item.get("seller_name")]
-    )]
+    if stores:
+        candidates = [item for item in items if stores & identifiers(
+            [item.get("seller_id"), item.get("seller_name")]
+        )]
+    else:
+        # 空名单按列表报价选策略 Top3，仅决定加强对象，不裁剪入库候选。
+        candidates = select_top3(items, policies or [])
     print(f"  -> 店铺加强: {len(items)} 条中需查看 {len(candidates)} 家")
     started = perf_counter()
     for item in candidates:
@@ -384,7 +391,7 @@ async def refresh_other_offer_prices(page, items, timeout_ms=15000, enhance_stor
     return items
 
 
-async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enhance_stores=None) -> list:
+async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enhance_stores=None, policies=None) -> list:
     """爬取游戏币分类页 #pcOtherOffer 下的竞品商户卡片"""
     offer_limit = config.CRAWL_OFFER_LIMIT
     print(f"  [*] 打开游戏币页面: {url}")
@@ -528,13 +535,15 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enh
         items.append(item)
 
     if refresh_unit_prices:
-        return await refresh_other_offer_prices(page, items, enhance_stores=enhance_stores)
+        return await refresh_other_offer_prices(page, items, enhance_stores=enhance_stores, policies=policies)
     return items
 
 
 async def scrape_eldorado_page(page, url: str) -> list:
     """爬取 Eldorado 游戏币页面，优先直连官方 offers API，DOM 作为兜底。"""
     from urllib.parse import parse_qs, quote, urlencode, urlparse
+
+    offer_limit = config.ELD_OFFER_PAGE_SIZE
 
     print(f"  [*] 打开 Eldorado 页面: {url}")
 
@@ -552,7 +561,7 @@ async def scrape_eldorado_page(page, url: str) -> list:
             ("gameId", legacy_match.group(1)),
             ("category", category_map.get(legacy_match.group(2) or "0", "Currency")),
         ]
-        # 属性筛选参数：除 te_v* 和 offerSortingCriterion 外全部透传，
+        # 属性筛选透传，排序单独设置；分页参数不透传，固定第一页 8 条。
         # 否则会抓成该游戏的全量报价而不是当前筛选的道具。
         passthrough = []
         for key, values in sorted(query.items()):
@@ -561,11 +570,11 @@ async def scrape_eldorado_page(page, url: str) -> list:
             env_match = re.fullmatch(r"te_v(\d+)", key)
             if env_match:
                 params.append((f"tradeEnvironmentValue{env_match.group(1)}", values[0]))
-            elif key != "offerSortingCriterion":
+            elif key not in {"offerSortingCriterion", "pageIndex", "pageSize", "page", "page_size"}:
                 passthrough.append((key, values[0]))
         params.extend([
             ("pageIndex", "1"),
-            ("pageSize", "150"),
+            ("pageSize", str(offer_limit)),
             ("offerSortingCriterion", query.get("offerSortingCriterion", ["Cheapest"])[0]),
         ])
         params.extend(passthrough)
@@ -631,7 +640,7 @@ async def scrape_eldorado_page(page, url: str) -> list:
         if api_response is not None and api_response.ok:
             payload = await api_response.json()
             api_items = []
-            for record in payload.get("results", []):
+            for record in payload.get("results", [])[:offer_limit]:
                 offer = record.get("offer") or {}
                 user = record.get("user") or {}
                 order_info = record.get("userOrderInfo") or {}
@@ -748,11 +757,13 @@ async def scrape_eldorado_page(page, url: str) -> list:
         print("  [!] 超时：未找到 #other-sellers .offer-row")
         return []
 
-    # 滚动加载，连续两轮数量不变才停止
+    # 第一页够 8 条后不再滚动加载；不足时等首屏渲染稳定。
     previous_count = -1
     stable_rounds = 0
     for _ in range(10):
         count = len(await page.query_selector_all(card_selector))
+        if count >= offer_limit:
+            break
         if count == previous_count:
             stable_rounds += 1
         else:
@@ -760,7 +771,6 @@ async def scrape_eldorado_page(page, url: str) -> list:
         if stable_rounds >= 2:
             break
         previous_count = count
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await asyncio.sleep(2)
 
     # 等待价格元素渲染完成（eld-offer-price 是异步组件）
@@ -783,8 +793,8 @@ async def scrape_eldorado_page(page, url: str) -> list:
         print(f"  [!] 价格元素未渲染，eld-offer-price HTML: {eld_html[:500]}")
 
     items_raw = await page.evaluate("""
-        () => {
-            const rows = document.querySelectorAll('#other-sellers .offer-row');
+        limit => {
+            const rows = Array.from(document.querySelectorAll('#other-sellers .offer-row')).slice(0, limit);
             const results = [];
 
             rows.forEach(row => {
@@ -857,7 +867,7 @@ async def scrape_eldorado_page(page, url: str) -> list:
             });
             return results;
         }
-    """)
+    """, offer_limit)
 
     items = []
     for raw in items_raw:
@@ -978,11 +988,15 @@ async def run(worker_index: int = 0, worker_count: int = 1):
             )
 
             try:
-                # 0 为列表抓取，1 仅对绑定店铺刷新详情；均保存全部列表候选。
+                # 1 优先按绑定店铺加强，空名单按策略 Top3 加强；均保存全部候选。
                 crawl_type = target.get("crawl_type") or 0
                 enhance_enabled = crawl_type in (1, "1", "top3")
                 if not enhance_enabled and crawl_type not in (0, "0", "default"):
                     raise ValueError(f"未知爬虫类型: {crawl_type}")
+                enhance_stores = target.get("enhance_stores") or ""
+                enhance_policies = None
+                if enhance_enabled and category in {"金币", "游戏币"} and not identifiers(enhance_stores):
+                    enhance_policies = compile_policies(db.get_crawl_strategies(target_id))
 
                 # 爬取前先将版本号 +1，本批数据全部使用新版本号写入。
                 # PHP 侧通过 crawl_target.version 对应 crawl_data.version 做改价策略。
@@ -1041,7 +1055,7 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                     if enhance_enabled:
                         items = await scrape_other_offer_page(
                             page, url, refresh_unit_prices=True,
-                            enhance_stores=target.get("enhance_stores") or "",
+                            enhance_stores=enhance_stores, policies=enhance_policies,
                         )
                     else:
                         items = await scrape_other_offer_page(page, url)
