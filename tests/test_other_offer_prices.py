@@ -1,4 +1,5 @@
 """本地 DOM 夹具验证逐店查看的异步价格切换，不请求真实平台。"""
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -150,6 +151,48 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "店铺 a 详情单价刷新失败"):
             await refresh_other_offer_prices(self.page, [row], timeout_ms=300, enhance_stores="a")
         self.assertEqual(row["price"], "0.01")
+
+    async def setup_single_unit_detail(self, quantity="1", replace_price=True):
+        await self.page.evaluate("""state => {
+            const container = document.querySelector('.pricing-container');
+            container.innerHTML = `<input value="${state.quantity}"><div>
+                <div>Total amount</div><div><span id="final-price">99</span><span>USD</span></div>
+            </div>`;
+            document.querySelector('#pcOtherOffer button').onclick = () => {
+                document.querySelector('#pcMain a').setAttribute('href', '/a');
+                if (state.replacePrice) setTimeout(() => {
+                    const old = document.querySelector('#final-price');
+                    const fresh = old.cloneNode();
+                    fresh.textContent = '33.600001';
+                    old.replaceWith(fresh);
+                }, 80);
+            };
+        }""", {"quantity": quantity, "replacePrice": replace_price})
+
+    async def test_single_unit_detail_without_unit_label_refreshes_real_price(self):
+        await self.setup_single_unit_detail()
+        row = {"seller_id": "a", "price": "33.6", "currency": "USD"}
+        await refresh_other_offer_prices(self.page, [row], timeout_ms=2000, enhance_stores="a")
+        self.assertEqual(row["price"], "33.600001")
+        self.assertEqual(row["unit_price_source"], "offer_detail_single_unit")
+
+    async def test_multiple_unit_total_and_stale_single_unit_amount_are_rejected(self):
+        for quantity, replace_price in (("2", True), ("1", False)):
+            with self.subTest(quantity=quantity, replace_price=replace_price):
+                await self.page.evaluate("document.querySelector('#pcMain a').setAttribute('href', '/initial')")
+                await self.setup_single_unit_detail(quantity, replace_price)
+                row = {"seller_id": "a", "price": "0.01"}
+                with self.assertRaisesRegex(ValueError, "等待店铺及详情价格刷新"):
+                    await refresh_other_offer_prices(self.page, [row], timeout_ms=300, enhance_stores="a")
+                self.assertEqual(row["price"], "0.01")
+
+    async def test_dom_read_is_bounded_by_whole_seller_deadline(self):
+        async def hung_evaluate(*args, **kwargs):
+            await asyncio.Event().wait()
+        with patch.object(self.page, "evaluate", side_effect=hung_evaluate):
+            with self.assertRaisesRegex(ValueError, "定位店铺.*总等待超过"):
+                await refresh_other_offer_prices(self.page, [{"seller_id": "a"}],
+                                                timeout_ms=100, enhance_stores="a")
 
     async def test_only_bound_names_refresh_and_unbound_rows_keep_list_data(self):
         rows = [

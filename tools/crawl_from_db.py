@@ -339,56 +339,96 @@ async def refresh_other_offer_prices(page, items, timeout_ms=15000, enhance_stor
         candidates = select_top3(items, policies or [])
     print(f"  -> 店铺加强: {len(items)} 条中需查看 {len(candidates)} 家")
     started = perf_counter()
-    for item in candidates:
+    for index, item in enumerate(candidates, 1):
         seller_id = item.get("seller_id")
-        if not seller_id:
-            raise ValueError("加强店铺缺少 seller_id，不能确认详情单价归属")
-        seller_path = "/" + seller_id
-        card = page.locator("#pcOtherOffer .other-seller--gradient").filter(
-            has=page.locator(f"a[href={json.dumps(seller_path, ensure_ascii=False)}]")
-        )
-        if await card.count() != 1:
-            raise ValueError(f"无法唯一定位加强店铺: {seller_id}")
-        previous = await page.query_selector(DETAIL_UNIT_PRICE_SELECTOR)
-        previous_text = await previous.inner_text() if previous else ""
+        print(f"  -> 加强 [{index}/{len(candidates)}] {seller_id}: 开始定位", flush=True)
+        stage = ["定位店铺"]
+        try:
+            # DOM 读取、点击及句柄清理也计入同一个期限，避免局部超时之外无限等待。
+            await asyncio.wait_for(
+                _refresh_other_offer_price(page, item, timeout_ms, stage),
+                timeout=timeout_ms / 1000,
+            )
+        except Exception as error:
+            reason = f"总等待超过 {timeout_ms / 1000:g}s" if isinstance(error, asyncio.TimeoutError) else str(error)
+            raise ValueError(f"加强店铺 {seller_id} 详情单价刷新失败（{stage[0]}）: {reason}") from error
+    print(f"  -> 店铺详情刷新: {len(candidates)} 家，耗时 {perf_counter() - started:.1f}s")
+    return items
+
+
+async def _refresh_other_offer_price(page, item, timeout_ms, stage):
+    seller_id = item.get("seller_id")
+    if not seller_id:
+        raise ValueError("加强店铺缺少 seller_id，不能确认详情单价归属")
+    seller_path = "/" + seller_id
+    card = page.locator("#pcOtherOffer .other-seller--gradient").filter(
+        has=page.locator(f"a[href={json.dumps(seller_path, ensure_ascii=False)}]")
+    )
+    if await card.count() != 1:
+        raise ValueError(f"无法唯一定位加强店铺: {seller_id}")
+    # 数量为 1 时 G2G 不渲染单价节点，记录详情金额节点以校验异步刷新。
+    previous = await page.query_selector(
+        DETAIL_UNIT_PRICE_SELECTOR + ", .vue-portal-target .pricing-container #final-price"
+    )
+    try:
+        previous_text = await previous.text_content() if previous else ""
         selected = await page.evaluate("""path => Array.from(
             document.querySelectorAll('#pcMain a.g-card-no-deco.cursor-pointer')
         ).some(a => new URL(a.href).pathname.toLowerCase() === path.toLowerCase())
         """, seller_path)
+        stage[0] = "点击查看"
+        print(f"  -> 加强 {seller_id}: 点击查看", flush=True)
+        await card.get_by_role("button", name=re.compile(r"^(查看|View)$", re.I)).click(
+            timeout=max(1, timeout_ms - 100), no_wait_after=True,
+        )
+        stage[0] = "等待店铺及详情价格刷新"
+        print(f"  -> 加强 {seller_id}: 等待详情价格", flush=True)
+        result = await page.wait_for_function("""state => {
+            const seller = Array.from(document.querySelectorAll(
+                '#pcMain a.g-card-no-deco.cursor-pointer'
+            )).some(a => new URL(a.href).pathname.toLowerCase() === state.path.toLowerCase());
+            if (!seller) return false;
+            const visible = el => el && el.getClientRects().length;
+            const prices = Array.from(document.querySelectorAll(state.selector))
+                .filter(el => visible(el) && /^(单价|Unit\\s*price)/i.test(el.innerText.trim()));
+            let price, text, source;
+            if (prices.length === 1) {
+                price = prices[0];
+                text = price.innerText.trim();
+                source = 'offer_detail';
+            } else if (prices.length === 0) {
+                const containers = Array.from(document.querySelectorAll('.vue-portal-target .pricing-container'))
+                    .filter(visible);
+                if (containers.length !== 1) return false;
+                const container = containers[0];
+                const inputs = container.querySelectorAll('input');
+                // 只接受确定的一件金额，不能把多件总价或其他金额当作单价。
+                if (inputs.length !== 1 || !/^1(?:\\.0+)?$/.test(inputs[0].value.trim())) return false;
+                price = container.querySelector('#final-price');
+                const currency = price && price.nextElementSibling;
+                if (!visible(price) || !visible(currency)) return false;
+                const label = price.parentElement.previousElementSibling;
+                if (!label || !/^(总金额|总价|Total\\s*amount)$/i.test(label.innerText.trim())) return false;
+                text = '单价 ' + price.innerText.trim() + ' ' + currency.innerText.trim();
+                source = 'offer_detail_single_unit';
+            } else return false;
+            const refreshed = state.selected || price !== state.previous
+                || price.textContent.trim() !== state.text.trim();
+            return refreshed && {text, source};
+        }""", arg={"path": seller_path, "selector": DETAIL_UNIT_PRICE_SELECTOR,
+                    "previous": previous, "text": previous_text, "selected": selected},
+            timeout=max(1, timeout_ms - 100))
         try:
-            await card.get_by_role("button", name=re.compile(r"^(查看|View)$", re.I)).click(
-                timeout=timeout_ms,
-            )
-            # 详情异步切换；店铺身份、价格节点刷新必须同时确认。
-            # 已选中店铺的查看可能无操作，允许使用其已加载的详情单价。
-            result = await page.wait_for_function("""state => {
-                const seller = Array.from(document.querySelectorAll(
-                    '#pcMain a.g-card-no-deco.cursor-pointer'
-                )).some(a => new URL(a.href).pathname.toLowerCase() === state.path.toLowerCase());
-                const prices = Array.from(document.querySelectorAll(state.selector))
-                    .filter(el => el.getClientRects().length && /^(单价|Unit\\s*price)/i.test(el.innerText.trim()));
-                if (!seller || prices.length !== 1) return false;
-                const price = prices[0];
-                const refreshed = state.selected || price !== state.previous
-                    || price.innerText.trim() !== state.text.trim();
-                return refreshed && price.innerText.trim();
-            }""", arg={"path": seller_path, "selector": DETAIL_UNIT_PRICE_SELECTOR,
-                        "previous": previous, "text": previous_text, "selected": selected},
-                timeout=timeout_ms)
-            try:
-                price, currency = parse_detail_unit_price(await result.json_value())
-            finally:
-                await result.dispose()
-            item.update(price=price, unit_price=price, currency=currency,
-                        price_label="单价", unit_price_source="offer_detail")
-            print(f"  -> 店铺 {seller_id} 详情单价: {price} {currency}")
-        except Exception as error:
-            raise ValueError(f"加强店铺 {seller_id} 详情单价刷新失败: {error}") from error
+            detail = await result.json_value()
+            price, currency = parse_detail_unit_price(detail["text"])
         finally:
-            if previous:
-                await previous.dispose()
-    print(f"  -> 店铺详情刷新: {len(candidates)} 家，耗时 {perf_counter() - started:.1f}s")
-    return items
+            await result.dispose()
+        item.update(price=price, unit_price=price, currency=currency,
+                    price_label="单价", unit_price_source=detail["source"])
+        print(f"  -> 店铺 {seller_id} 详情单价: {price} {currency} ({detail['source']})", flush=True)
+    finally:
+        if previous and not asyncio.current_task().cancelling():
+            await previous.dispose()
 
 
 async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enhance_stores=None, policies=None) -> list:

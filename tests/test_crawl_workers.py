@@ -61,6 +61,32 @@ class CrawlWorkerTests(unittest.TestCase):
                 targets.assert_called_once_with(1, 2)
                 browser.assert_not_called()
 
+    def test_launcher_defaults_to_one_and_skips_locked_round(self):
+        launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()
+        for lock_exit, expected_exit in ((0, 0), (1, 0), (2, 2)):
+            with self.subTest(lock_exit=lock_exit), tempfile.TemporaryDirectory() as directory:
+                script = launcher.replace("/www/wwwroot/game_crawl", directory)
+                script = script.replace("/usr/bin/xvfb-run", "fake_worker")
+                script = script.replace("/usr/bin/flock", "fake_flock")
+                prelude = f"""
+unset CRAWL_WORKER_COUNT
+fake_flock() {{ return {lock_exit}; }}
+fake_worker() {{
+    echo "$*" >> "{directory}/events"
+}}
+"""
+                result = subprocess.run(["bash", "-c", prelude + script], text=True,
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, expected_exit, result.stderr)
+                events = Path(directory) / "events"
+                if lock_exit == 0:
+                    calls = events.read_text().splitlines()
+                    self.assertEqual(len(calls), 1)
+                    self.assertIn("-a -n 90", calls[0])
+                    self.assertIn("--worker-count 1 --worker-index 0", calls[0])
+                else:
+                    self.assertFalse(events.exists())
+
     def test_launcher_runs_both_workers_and_waits_after_failure(self):
         # Exercise the actual launcher, replacing only server paths and external
         # executables. The fake workers overlap and the second finishes last.
@@ -69,7 +95,10 @@ class CrawlWorkerTests(unittest.TestCase):
             with self.subTest(first_exit=first_exit), tempfile.TemporaryDirectory() as directory:
                 script = launcher.replace("/www/wwwroot/game_crawl", directory)
                 script = script.replace("/usr/bin/xvfb-run", "fake_worker")
+                script = script.replace("/usr/bin/flock", "fake_flock")
                 prelude = f'''
+export CRAWL_WORKER_COUNT=2
+fake_flock() {{ return 0; }}
 fake_worker() {{
     local index="${{!#}}"
     local display=""
