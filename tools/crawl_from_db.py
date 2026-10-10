@@ -601,7 +601,7 @@ async def scrape_eldorado_page(page, url: str) -> list:
             ("gameId", legacy_match.group(1)),
             ("category", category_map.get(legacy_match.group(2) or "0", "Currency")),
         ]
-        # 属性筛选透传，排序单独设置；分页参数不透传，固定第一页 8 条。
+        # 属性筛选透传，排序单独设置；分页参数不透传，固定第一页，条数由 ELD_OFFER_PAGE_SIZE 控制。
         # 否则会抓成该游戏的全量报价而不是当前筛选的道具。
         passthrough = []
         for key, values in sorted(query.items()):
