@@ -385,6 +385,7 @@ async def refresh_other_offer_prices(page, items, timeout_ms=15000, policies=Non
 
 async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, policies=None) -> list:
     """爬取游戏币分类页 #pcOtherOffer 下的竞品商户卡片"""
+    offer_limit = config.CRAWL_OFFER_LIMIT
     print(f"  [*] 打开游戏币页面: {url}")
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
@@ -397,11 +398,13 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, pol
             break
         await asyncio.sleep(1)
 
-    # 页面可能在滚动后继续加载竞品，连续两轮数量不变才停止。
+    # 达到抓取上限即停止等待；不足时才尝试滚动加载。
     previous_count = -1
     stable_rounds = 0
     for _ in range(10):
         count = len(await page.query_selector_all(card_selector))
+        if count >= offer_limit:
+            break
         if count == previous_count:
             stable_rounds += 1
         else:
@@ -414,11 +417,11 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, pol
 
     items_raw = await page.evaluate(
         """
-        () => {
+        limit => {
             const container = document.querySelector('#pcOtherOffer');
             if (!container) return [];
 
-            const cards = container.querySelectorAll('.other-seller--gradient');
+            const cards = Array.from(container.querySelectorAll('.other-seller--gradient')).slice(0, limit);
             const results = [];
             const absoluteUrl = (href) => {
                 try { return new URL(href, window.location.href).href; }
@@ -498,7 +501,7 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, pol
             });
             return results;
         }
-        """
+        """, offer_limit,
     )
 
     items = []

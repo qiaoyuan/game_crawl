@@ -48,6 +48,11 @@ if _crawl_server not in ("1", "2"):
     raise ValueError("crawl_server 必须为 1 或 2")
 CRAWL_SERVER = int(_crawl_server)
 
+# G2G 金币/游戏币页面按当前展示顺序，仅抓取前 N 条竞品。
+CRAWL_OFFER_LIMIT = int(os.environ.get("CRAWL_OFFER_LIMIT", "10"))
+if CRAWL_OFFER_LIMIT < 1:
+    raise ValueError("CRAWL_OFFER_LIMIT 必须为正整数")
+
 # 浏览器
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

@@ -1,10 +1,13 @@
 """本地 DOM 夹具验证逐店查看的异步价格切换，不请求真实平台。"""
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import async_playwright
 
 from g2g.crawl_filter import compile_policies, select_top3
 from tools.crawl_from_db import parse_detail_unit_price, refresh_other_offer_prices
+from tools import crawl_from_db
 
 
 class DetailPriceParsingTests(unittest.TestCase):
@@ -69,6 +72,35 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["seller_id"] for row in select_top3(rows, compiled)], list("abc"))
         compiled = compile_policies([{"config": {}, "currency": "USD"}])
         self.assertEqual([row["seller_id"] for row in select_top3(rows, compiled)], list("bcd"))
+
+    async def test_page_only_extracts_first_ten_before_top3_without_extra_loading(self):
+        await self.page.evaluate("""() => {
+            const container = document.querySelector('#pcOtherOffer');
+            container.innerHTML = '';
+            for (let i = 0; i < 20; i++) {
+                const card = document.createElement('div');
+                card.className = 'other-seller--gradient';
+                card.innerHTML = `<a href="https://www.g2g.com/seller${i}">seller${i}</a>
+                    <span class="text-primary text-body text-weight-bold">${20-i}</span>`;
+                container.append(card);
+            }
+        }""")
+        for refresh in (False, True):
+            with self.subTest(refresh=refresh), \
+                 patch.object(self.page, "goto", new=AsyncMock()), \
+                 patch.object(crawl_from_db.config, "CRAWL_OFFER_LIMIT", 10), \
+                 patch.object(crawl_from_db, "asyncio", SimpleNamespace(sleep=AsyncMock())) as async_stub, \
+                 patch.object(crawl_from_db, "refresh_other_offer_prices", new=AsyncMock()) as detail:
+                rows = await crawl_from_db.scrape_other_offer_page(
+                    self.page, "https://www.g2g.com/test", refresh_unit_prices=refresh,
+                )
+                if refresh:
+                    rows = detail.await_args.args[1]
+                else:
+                    detail.assert_not_awaited()
+                self.assertEqual([row["seller_id"] for row in rows],
+                                 [f"seller{i}" for i in range(10)])
+                async_stub.sleep.assert_not_awaited()
 
     async def test_stale_portal_for_new_seller_times_out_instead_of_using_old_price(self):
         await self.page.evaluate("""() => {
