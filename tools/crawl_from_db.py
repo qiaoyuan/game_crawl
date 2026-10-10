@@ -12,6 +12,7 @@ import math
 import re
 from playwright.async_api import async_playwright
 from g2g import config, db
+from g2g.crawl_filter import compile_policies, select_top3
 
 # 货币符号 → 货币代码映射（页面实际显示的货币）
 CURRENCY_SYMBOL_MAP = {
@@ -894,6 +895,18 @@ async def run(worker_index: int = 0, worker_count: int = 1):
             )
 
             try:
+                # 0 保持原行为，1 为 Top3；兼容迁移前字符串和驱动返回的数字字符串。
+                crawl_type = target.get("crawl_type") or 0
+                policies = None
+                if crawl_type in (1, "1", "top3"):
+                    strategies = db.get_crawl_strategies(target_id)
+                    if not strategies:
+                        print("  -> Top3 跳过: 未找到绑定有效产品的启用改价策略")
+                        continue
+                    policies = compile_policies(strategies)
+                elif crawl_type not in (0, "0", "default"):
+                    raise ValueError(f"未知爬虫类型: {crawl_type}")
+
                 # 爬取前先将版本号 +1，本批数据全部使用新版本号写入。
                 # PHP 侧通过 crawl_target.version 对应 crawl_data.version 做改价策略。
                 version = db.increment_version(target_id)
@@ -952,6 +965,11 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                 else:
                     items = await scrape_page(page, url)
                 print(f"  -> 提取 {len(items)} 条")
+
+                if policies is not None:
+                    before_count = len(items)
+                    items = select_top3(items, policies)
+                    print(f"  -> Top3 策略过滤: {before_count} 条 -> 入库 {len(items)} 条")
 
                 inserted = db.save_crawl_data(
                     target_id,

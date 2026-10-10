@@ -50,6 +50,26 @@ def update_last_crawl(target_id: int):
         conn.close()
 
 
+def get_crawl_strategies(target_id: int) -> list:
+    """Top3 读取启用策略及其绑定产品币种；仅按目标 ID 关联，不读取其他目标策略。"""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ps.id, ps.config, "
+                "COALESCE(NULLIF(gp.currency, ''), 'USD') AS currency "
+                "FROM price_strategy ps "
+                "JOIN price_strategy_product spp ON spp.price_strategy_id = ps.id "
+                "JOIN game_product gp ON gp.id = spp.game_product_id AND gp.deleted_at IS NULL "
+                "WHERE ps.crawl_target_id = %s AND ps.status = 1 AND ps.deleted_at IS NULL "
+                "ORDER BY ps.id",
+                (target_id,),
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
 def increment_version(target_id: int) -> int:
     """将 crawl_target.version +1，返回更新后的新版本号"""
     conn = get_connection()
