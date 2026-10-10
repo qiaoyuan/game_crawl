@@ -81,6 +81,32 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
             await refresh_other_offer_prices(self.page, [row], timeout_ms=300)
         self.assertEqual(row["price"], "0.01")
 
+    async def test_prefilter_skips_ineligible_stores_keeps_union_and_ignores_list_price(self):
+        rows = [
+            {"seller_id": "a", "stock": "1K", "rating": "99", "price": "0.0001", "currency": "EUR"},
+            {"seller_id": "b", "stock": "1", "rating": "0", "price": "0.0001"},
+            {"seller_id": "c", "stock": "1K", "rating": "89", "price": "0.433299"},
+            {"seller_id": "d", "stock": "1K", "rating": "99", "price": "0.2"},
+        ]
+        compiled = compile_policies([
+            {"config": {"blacklist_stores": ["b", "d"], "min_stock": 50, "min_rating": 90,
+                        "minimum_price": 0.3}, "currency": "USD"},
+            {"config": {"blacklist_stores": ["d"], "whitelist_stores": ["b"],
+                        "min_stock": 50, "min_rating": 90}, "currency": "USD"},
+        ])
+        result = await refresh_other_offer_prices(self.page, rows, timeout_ms=2000, policies=compiled)
+        self.assertEqual(await self.page.evaluate("window.clicks"), ["a", "b"])
+        self.assertEqual([row["seller_id"] for row in result], ["a", "b"])
+        self.assertEqual([row["price"] for row in result], ["0.9", "0.4"])
+        self.assertEqual(result[0]["currency"], "USD")
+        self.assertEqual(select_top3(result, compiled), result)
+
+    async def test_no_possible_store_does_not_open_any_detail(self):
+        rows = [{"seller_id": "a", "stock": "0", "rating": "99"}]
+        compiled = compile_policies([{"config": {"min_stock": 50}, "currency": "USD"}])
+        self.assertEqual(await refresh_other_offer_prices(self.page, rows, policies=compiled), [])
+        self.assertEqual(await self.page.evaluate("window.clicks"), [])
+
     async def test_already_selected_seller_can_keep_loaded_detail_when_view_is_noop(self):
         await self.page.evaluate("""() => {
             document.querySelector('#pcMain a').setAttribute('href', '/a');

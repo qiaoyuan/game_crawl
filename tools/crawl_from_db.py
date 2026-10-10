@@ -10,9 +10,10 @@ import asyncio
 import json
 import math
 import re
+from time import perf_counter
 from playwright.async_api import async_playwright
 from g2g import config, db
-from g2g.crawl_filter import compile_policies, number, select_top3
+from g2g.crawl_filter import compile_policies, filter_store_candidates, number, select_top3
 
 # 货币符号 → 货币代码映射（页面实际显示的货币）
 CURRENCY_SYMBOL_MAP = {
@@ -323,8 +324,13 @@ def parse_detail_unit_price(text):
     return match[1].replace(",", ""), match[2].upper()
 
 
-async def refresh_other_offer_prices(page, items, timeout_ms=15000):
+async def refresh_other_offer_prices(page, items, timeout_ms=15000, policies=None):
     """逐店查看详情；任何单价未确认时中止目标，避免用旧价生成改价通知。"""
+    if policies is not None:
+        before_count = len(items)
+        items = filter_store_candidates(items, policies)
+        print(f"  -> Top3 店铺预筛: {before_count} 条 -> 需查看 {len(items)} 条")
+    started = perf_counter()
     for item in items:
         seller_id = item.get("seller_id")
         if not seller_id:
@@ -373,10 +379,11 @@ async def refresh_other_offer_prices(page, items, timeout_ms=15000):
         finally:
             if previous:
                 await previous.dispose()
+    print(f"  -> Top3 详情刷新: {len(items)} 家，耗时 {perf_counter() - started:.1f}s")
     return items
 
 
-async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False) -> list:
+async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, policies=None) -> list:
     """爬取游戏币分类页 #pcOtherOffer 下的竞品商户卡片"""
     print(f"  [*] 打开游戏币页面: {url}")
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -517,7 +524,7 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False) -> 
         items.append(item)
 
     if refresh_unit_prices:
-        return await refresh_other_offer_prices(page, items)
+        return await refresh_other_offer_prices(page, items, policies=policies)
     return items
 
 
@@ -1034,7 +1041,9 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                         await eld_context.close()
                 elif category in {"金币", "游戏币"}:
                     if policies is not None:
-                        items = await scrape_other_offer_page(page, url, refresh_unit_prices=True)
+                        items = await scrape_other_offer_page(
+                            page, url, refresh_unit_prices=True, policies=policies,
+                        )
                     else:
                         items = await scrape_other_offer_page(page, url)
                 else:

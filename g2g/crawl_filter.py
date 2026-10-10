@@ -106,10 +106,8 @@ def compile_policies(strategies):
             for strategy in strategies]
 
 
-def eligible(item, policy, currency):
-    price = item_price(item)
-    if item.get("currency") != currency or price is None or price <= 0:
-        return False
+def eligible_store(item, policy):
+    """不依赖价格/币种的条件，可在打开详情前筛选。"""
     stores = identifiers([item.get("seller_id"), item.get("seller_name")])
     if stores & policy["blacklist"]:
         return False
@@ -120,6 +118,20 @@ def eligible(item, policy, currency):
             return False
         if policy["min_rating"] > 0 and (rating is None or rating < policy["min_rating"]):
             return False
+    return True
+
+
+def filter_store_candidates(items, policies):
+    """多策略取候选合集；列表价格和币种不能用于提前剔除。"""
+    return [item for item in items if any(eligible_store(item, policy) for policy, _ in policies)]
+
+
+def eligible(item, policy, currency):
+    price = item_price(item)
+    if item.get("currency") != currency or price is None or price <= 0:
+        return False
+    if not eligible_store(item, policy):
+        return False
     return policy["filter_price"] is None or price > policy["filter_price"]
 
 
