@@ -12,7 +12,7 @@ import math
 import re
 from playwright.async_api import async_playwright
 from g2g import config, db
-from g2g.crawl_filter import compile_policies, select_top3
+from g2g.crawl_filter import compile_policies, number, select_top3
 
 # 货币符号 → 货币代码映射（页面实际显示的货币）
 CURRENCY_SYMBOL_MAP = {
@@ -306,7 +306,77 @@ async def scrape_page(page, url: str) -> list:
     return items
 
 
-async def scrape_other_offer_page(page, url: str) -> list:
+DETAIL_UNIT_PRICE_SELECTOR = (
+    ".vue-portal-target .pricing-container .text-center.text-body-2.g-mt-12"
+)
+
+
+def parse_detail_unit_price(text):
+    """只解析详情标注的单价，不接受列表最低价或订单总价。"""
+    match = re.match(
+        r"^\s*(?:单价|Unit\s*price)\s*([\d,]+(?:\.\d+)?)\s*([A-Z]{3})\b",
+        text, re.IGNORECASE,
+    )
+    value = number(match[1].replace(",", "")) if match else None
+    if value is None or value <= 0:
+        raise ValueError(f"详情单价无效: {text!r}")
+    return match[1].replace(",", ""), match[2].upper()
+
+
+async def refresh_other_offer_prices(page, items, timeout_ms=15000):
+    """逐店查看详情；任何单价未确认时中止目标，避免用旧价生成改价通知。"""
+    for item in items:
+        seller_id = item.get("seller_id")
+        if not seller_id:
+            raise ValueError("Top3 店铺缺少 seller_id，不能确认详情单价归属")
+        seller_path = "/" + seller_id
+        card = page.locator("#pcOtherOffer .other-seller--gradient").filter(
+            has=page.locator(f"a[href={json.dumps(seller_path, ensure_ascii=False)}]")
+        )
+        if await card.count() != 1:
+            raise ValueError(f"Top3 无法唯一定位店铺: {seller_id}")
+        previous = await page.query_selector(DETAIL_UNIT_PRICE_SELECTOR)
+        previous_text = await previous.inner_text() if previous else ""
+        selected = await page.evaluate("""path => Array.from(
+            document.querySelectorAll('#pcMain a.g-card-no-deco.cursor-pointer')
+        ).some(a => new URL(a.href).pathname.toLowerCase() === path.toLowerCase())
+        """, seller_path)
+        try:
+            await card.get_by_role("button", name=re.compile(r"^(查看|View)$", re.I)).click(
+                timeout=timeout_ms,
+            )
+            # 详情异步切换；店铺身份、价格节点刷新必须同时确认。
+            # 已选中店铺的查看可能无操作，允许使用其已加载的详情单价。
+            result = await page.wait_for_function("""state => {
+                const seller = Array.from(document.querySelectorAll(
+                    '#pcMain a.g-card-no-deco.cursor-pointer'
+                )).some(a => new URL(a.href).pathname.toLowerCase() === state.path.toLowerCase());
+                const prices = Array.from(document.querySelectorAll(state.selector))
+                    .filter(el => el.getClientRects().length && /^(单价|Unit\\s*price)/i.test(el.innerText.trim()));
+                if (!seller || prices.length !== 1) return false;
+                const price = prices[0];
+                const refreshed = state.selected || price !== state.previous
+                    || price.innerText.trim() !== state.text.trim();
+                return refreshed && price.innerText.trim();
+            }""", arg={"path": seller_path, "selector": DETAIL_UNIT_PRICE_SELECTOR,
+                        "previous": previous, "text": previous_text, "selected": selected},
+                timeout=timeout_ms)
+            try:
+                price, currency = parse_detail_unit_price(await result.json_value())
+            finally:
+                await result.dispose()
+            item.update(price=price, unit_price=price, currency=currency,
+                        price_label="单价", unit_price_source="offer_detail")
+            print(f"  -> 店铺 {seller_id} 详情单价: {price} {currency}")
+        except Exception as error:
+            raise ValueError(f"Top3 店铺 {seller_id} 详情单价刷新失败: {error}") from error
+        finally:
+            if previous:
+                await previous.dispose()
+    return items
+
+
+async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False) -> list:
     """爬取游戏币分类页 #pcOtherOffer 下的竞品商户卡片"""
     print(f"  [*] 打开游戏币页面: {url}")
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -446,6 +516,8 @@ async def scrape_other_offer_page(page, url: str) -> list:
         item.pop("currency_label", None)
         items.append(item)
 
+    if refresh_unit_prices:
+        return await refresh_other_offer_prices(page, items)
     return items
 
 
@@ -961,7 +1033,10 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                     finally:
                         await eld_context.close()
                 elif category in {"金币", "游戏币"}:
-                    items = await scrape_other_offer_page(page, url)
+                    if policies is not None:
+                        items = await scrape_other_offer_page(page, url, refresh_unit_prices=True)
+                    else:
+                        items = await scrape_other_offer_page(page, url)
                 else:
                     items = await scrape_page(page, url)
                 print(f"  -> 提取 {len(items)} 条")

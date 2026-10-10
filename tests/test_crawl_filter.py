@@ -162,6 +162,11 @@ class CrawlFilterTests(unittest.TestCase):
                         update.assert_not_called()
                         scrape.assert_not_called()
                     else:
+                        if crawl_type in (0, "0", None, "default"):
+                            scrape.assert_awaited_once_with(context.new_page.return_value, target["url"])
+                        else:
+                            scrape.assert_awaited_once_with(context.new_page.return_value, target["url"],
+                                                           refresh_unit_prices=True)
                         save.assert_called_once_with(10, "g2g", expected, game_product_id=1, version=8)
                         notify.assert_called_once_with(10, 8, len(expected))
                         update.assert_called_once_with(10)
