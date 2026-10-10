@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, patch
 
 from playwright.async_api import async_playwright
 
-from g2g.crawl_filter import compile_policies, select_top3
 from tools.crawl_from_db import parse_detail_unit_price, refresh_other_offer_prices
 from tools import crawl_from_db
 
@@ -61,19 +60,17 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.playwright.stop()
 
-    async def test_refreshes_every_seller_before_price_filter_and_top3(self):
+    async def test_refreshes_bound_sellers_without_discarding_rows(self):
         rows = [{"seller_id": seller, "price": str(index + 1), "currency": "USD"}
                 for index, seller in enumerate("abcd")]
-        await refresh_other_offer_prices(self.page, rows, timeout_ms=2000)
+        result = await refresh_other_offer_prices(self.page, rows, timeout_ms=2000, enhance_stores=list("abcd"))
+        self.assertIs(result, rows)
         self.assertEqual(await self.page.evaluate("window.clicks"), list("abcd"))
         self.assertEqual([row["price"] for row in rows], ["0.9", "0.4", "0.433299", "0.2"])
         self.assertTrue(all(row["unit_price"] == row["price"] for row in rows))
-        compiled = compile_policies([{"config": {"minimum_price": 0.3}, "currency": "USD"}])
-        self.assertEqual([row["seller_id"] for row in select_top3(rows, compiled)], list("abc"))
-        compiled = compile_policies([{"config": {}, "currency": "USD"}])
-        self.assertEqual([row["seller_id"] for row in select_top3(rows, compiled)], list("bcd"))
+        self.assertEqual(len(result), 4)
 
-    async def test_page_only_extracts_first_ten_before_top3_without_extra_loading(self):
+    async def test_page_only_extracts_first_ten_before_enhancement_without_extra_loading(self):
         await self.page.evaluate("""() => {
             const container = document.querySelector('#pcOtherOffer');
             container.innerHTML = '';
@@ -110,33 +107,29 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
         }""")
         row = {"seller_id": "a", "price": "0.01", "currency": "USD"}
         with self.assertRaisesRegex(ValueError, "店铺 a 详情单价刷新失败"):
-            await refresh_other_offer_prices(self.page, [row], timeout_ms=300)
+            await refresh_other_offer_prices(self.page, [row], timeout_ms=300, enhance_stores="a")
         self.assertEqual(row["price"], "0.01")
 
-    async def test_prefilter_skips_ineligible_stores_keeps_union_and_ignores_list_price(self):
+    async def test_only_bound_names_refresh_and_unbound_rows_keep_list_data(self):
         rows = [
             {"seller_id": "a", "stock": "1K", "rating": "99", "price": "0.0001", "currency": "EUR"},
-            {"seller_id": "b", "stock": "1", "rating": "0", "price": "0.0001"},
+            {"seller_id": "b", "seller_name": "JIANONE", "stock": "1", "rating": "0", "price": "0.0001"},
             {"seller_id": "c", "stock": "1K", "rating": "89", "price": "0.433299"},
             {"seller_id": "d", "stock": "1K", "rating": "99", "price": "0.2"},
         ]
-        compiled = compile_policies([
-            {"config": {"blacklist_stores": ["b", "d"], "min_stock": 50, "min_rating": 90,
-                        "minimum_price": 0.3}, "currency": "USD"},
-            {"config": {"blacklist_stores": ["d"], "whitelist_stores": ["b"],
-                        "min_stock": 50, "min_rating": 90}, "currency": "USD"},
-        ])
-        result = await refresh_other_offer_prices(self.page, rows, timeout_ms=2000, policies=compiled)
+        result = await refresh_other_offer_prices(self.page, rows, timeout_ms=2000,
+                                                enhance_stores=" A， jianone\nPlayer")
         self.assertEqual(await self.page.evaluate("window.clicks"), ["a", "b"])
-        self.assertEqual([row["seller_id"] for row in result], ["a", "b"])
-        self.assertEqual([row["price"] for row in result], ["0.9", "0.4"])
+        self.assertEqual([row["seller_id"] for row in result], list("abcd"))
+        self.assertEqual([row["price"] for row in result], ["0.9", "0.4", "0.433299", "0.2"])
         self.assertEqual(result[0]["currency"], "USD")
-        self.assertEqual(select_top3(result, compiled), result)
+        self.assertNotIn("unit_price_source", result[2])
+        self.assertNotIn("unit_price_source", result[3])
 
-    async def test_no_possible_store_does_not_open_any_detail(self):
+    async def test_empty_or_unmatched_names_keep_all_rows_without_detail_requests(self):
         rows = [{"seller_id": "a", "stock": "0", "rating": "99"}]
-        compiled = compile_policies([{"config": {"min_stock": 50}, "currency": "USD"}])
-        self.assertEqual(await refresh_other_offer_prices(self.page, rows, policies=compiled), [])
+        for stores in (None, "", "aa", "Player,JIANONE"):
+            self.assertEqual(await refresh_other_offer_prices(self.page, rows, enhance_stores=stores), rows)
         self.assertEqual(await self.page.evaluate("window.clicks"), [])
 
     async def test_already_selected_seller_can_keep_loaded_detail_when_view_is_noop(self):
@@ -146,7 +139,7 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
             document.querySelector('#pcOtherOffer button').onclick = () => {};
         }""")
         row = {"seller_id": "a", "price": "0.01", "currency": "USD"}
-        await refresh_other_offer_prices(self.page, [row], timeout_ms=1000)
+        await refresh_other_offer_prices(self.page, [row], timeout_ms=1000, enhance_stores="a")
         self.assertEqual(row["price"], "0.433299")
 
 

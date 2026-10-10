@@ -13,7 +13,7 @@ import re
 from time import perf_counter
 from playwright.async_api import async_playwright
 from g2g import config, db
-from g2g.crawl_filter import compile_policies, filter_store_candidates, number, select_top3
+from g2g.crawl_filter import identifiers, number
 
 # 货币符号 → 货币代码映射（页面实际显示的货币）
 CURRENCY_SYMBOL_MAP = {
@@ -324,23 +324,24 @@ def parse_detail_unit_price(text):
     return match[1].replace(",", ""), match[2].upper()
 
 
-async def refresh_other_offer_prices(page, items, timeout_ms=15000, policies=None):
+async def refresh_other_offer_prices(page, items, timeout_ms=15000, enhance_stores=None):
     """逐店查看详情；任何单价未确认时中止目标，避免用旧价生成改价通知。"""
-    if policies is not None:
-        before_count = len(items)
-        items = filter_store_candidates(items, policies)
-        print(f"  -> Top3 店铺预筛: {before_count} 条 -> 需查看 {len(items)} 条")
+    stores = identifiers(enhance_stores)
+    candidates = [item for item in items if stores & identifiers(
+        [item.get("seller_id"), item.get("seller_name")]
+    )]
+    print(f"  -> 店铺加强: {len(items)} 条中需查看 {len(candidates)} 家")
     started = perf_counter()
-    for item in items:
+    for item in candidates:
         seller_id = item.get("seller_id")
         if not seller_id:
-            raise ValueError("Top3 店铺缺少 seller_id，不能确认详情单价归属")
+            raise ValueError("加强店铺缺少 seller_id，不能确认详情单价归属")
         seller_path = "/" + seller_id
         card = page.locator("#pcOtherOffer .other-seller--gradient").filter(
             has=page.locator(f"a[href={json.dumps(seller_path, ensure_ascii=False)}]")
         )
         if await card.count() != 1:
-            raise ValueError(f"Top3 无法唯一定位店铺: {seller_id}")
+            raise ValueError(f"无法唯一定位加强店铺: {seller_id}")
         previous = await page.query_selector(DETAIL_UNIT_PRICE_SELECTOR)
         previous_text = await previous.inner_text() if previous else ""
         selected = await page.evaluate("""path => Array.from(
@@ -375,15 +376,15 @@ async def refresh_other_offer_prices(page, items, timeout_ms=15000, policies=Non
                         price_label="单价", unit_price_source="offer_detail")
             print(f"  -> 店铺 {seller_id} 详情单价: {price} {currency}")
         except Exception as error:
-            raise ValueError(f"Top3 店铺 {seller_id} 详情单价刷新失败: {error}") from error
+            raise ValueError(f"加强店铺 {seller_id} 详情单价刷新失败: {error}") from error
         finally:
             if previous:
                 await previous.dispose()
-    print(f"  -> Top3 详情刷新: {len(items)} 家，耗时 {perf_counter() - started:.1f}s")
+    print(f"  -> 店铺详情刷新: {len(candidates)} 家，耗时 {perf_counter() - started:.1f}s")
     return items
 
 
-async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, policies=None) -> list:
+async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enhance_stores=None) -> list:
     """爬取游戏币分类页 #pcOtherOffer 下的竞品商户卡片"""
     offer_limit = config.CRAWL_OFFER_LIMIT
     print(f"  [*] 打开游戏币页面: {url}")
@@ -527,7 +528,7 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, pol
         items.append(item)
 
     if refresh_unit_prices:
-        return await refresh_other_offer_prices(page, items, policies=policies)
+        return await refresh_other_offer_prices(page, items, enhance_stores=enhance_stores)
     return items
 
 
@@ -977,16 +978,10 @@ async def run(worker_index: int = 0, worker_count: int = 1):
             )
 
             try:
-                # 0 保持原行为，1 为 Top3；兼容迁移前字符串和驱动返回的数字字符串。
+                # 0 为列表抓取，1 仅对绑定店铺刷新详情；均保存全部列表候选。
                 crawl_type = target.get("crawl_type") or 0
-                policies = None
-                if crawl_type in (1, "1", "top3"):
-                    strategies = db.get_crawl_strategies(target_id)
-                    if not strategies:
-                        print("  -> Top3 跳过: 未找到绑定有效产品的启用改价策略")
-                        continue
-                    policies = compile_policies(strategies)
-                elif crawl_type not in (0, "0", "default"):
+                enhance_enabled = crawl_type in (1, "1", "top3")
+                if not enhance_enabled and crawl_type not in (0, "0", "default"):
                     raise ValueError(f"未知爬虫类型: {crawl_type}")
 
                 # 爬取前先将版本号 +1，本批数据全部使用新版本号写入。
@@ -1043,20 +1038,16 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                     finally:
                         await eld_context.close()
                 elif category in {"金币", "游戏币"}:
-                    if policies is not None:
+                    if enhance_enabled:
                         items = await scrape_other_offer_page(
-                            page, url, refresh_unit_prices=True, policies=policies,
+                            page, url, refresh_unit_prices=True,
+                            enhance_stores=target.get("enhance_stores") or "",
                         )
                     else:
                         items = await scrape_other_offer_page(page, url)
                 else:
                     items = await scrape_page(page, url)
                 print(f"  -> 提取 {len(items)} 条")
-
-                if policies is not None:
-                    before_count = len(items)
-                    items = select_top3(items, policies)
-                    print(f"  -> Top3 策略过滤: {before_count} 条 -> 入库 {len(items)} 条")
 
                 inserted = db.save_crawl_data(
                     target_id,

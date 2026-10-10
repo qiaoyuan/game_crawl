@@ -8,4 +8,4 @@ END;
 
 ALTER TABLE `crawl_target`
   MODIFY COLUMN `crawl_type` tinyint unsigned NOT NULL DEFAULT 0
-  COMMENT '爬虫类型 0-默认 1-按策略过滤后最低三条' AFTER `category`;
+  COMMENT '爬虫类型 0-默认 1-绑定店铺详情加强' AFTER `category`;

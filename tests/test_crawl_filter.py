@@ -118,20 +118,14 @@ class CrawlFilterTests(unittest.TestCase):
                                   [(1, "{}", "EUR"), (1, "{}", "USD")])
             connection.close.assert_called_once()
 
-    def test_run_saves_filtered_items_and_notification_count_default_is_unchanged(self):
+    def test_run_saves_all_rows_and_only_type_one_uses_bound_stores(self):
         rows = [item(str(i), i + 1) for i in range(6)]
-        for crawl_type, strategies, expected in [
-            (0, [], rows), ("0", [], rows), (None, [], rows),
-            (1, [{"config": {}, "currency": "USD"}], rows[:3]),
-            ("1", [{"config": {}, "currency": "USD"}], rows[:3]),
-            (1, [], None), (1, [{"config": "invalid"}], None),
-            (1, [{"config": {"min_rating": 100}}], []),
-            (2, [], None),
-            ("default", [], rows), ("top3", [{"config": {}, "currency": "USD"}], rows[:3]),
-            ("top3", [], None), ("top3", [{"config": "invalid"}], None),
-            ("top3", [{"config": {"min_rating": 100}}], []),
+        for crawl_type, stores, expected in [
+            (0, "Player,JIANONE", rows), ("0", "Player", rows), (None, "Player", rows),
+            (1, "Player,JIANONE", rows), ("1", "Player", rows), (1, "", rows),
+            (2, "", None), ("default", "Player", rows), ("top3", "Player", rows),
         ]:
-            with self.subTest(crawl_type=crawl_type, strategies=strategies):
+            with self.subTest(crawl_type=crawl_type, stores=stores):
                 browser, context, playwright = MagicMock(), MagicMock(), MagicMock()
                 browser.new_context = AsyncMock(return_value=context)
                 browser.close = AsyncMock()
@@ -143,9 +137,9 @@ class CrawlFilterTests(unittest.TestCase):
                 manager.__aenter__ = AsyncMock(return_value=playwright)
                 manager.__aexit__ = AsyncMock()
                 target = {"id": 10, "game_product_id": 1, "url": "https://example.com",
-                          "category": "游戏币", "crawl_type": crawl_type}
+                          "category": "游戏币", "crawl_type": crawl_type, "enhance_stores": stores}
                 with patch.object(db, "get_pending_targets", return_value=[target]), \
-                     patch.object(db, "get_crawl_strategies", return_value=strategies) as load, \
+                     patch.object(db, "get_crawl_strategies", side_effect=AssertionError("不应读取改价策略")) as load, \
                      patch.object(db, "increment_version", return_value=8) as increment, \
                      patch.object(db, "save_crawl_data", return_value=len(expected or [])) as save, \
                      patch.object(db, "update_last_crawl") as update, \
@@ -153,8 +147,7 @@ class CrawlFilterTests(unittest.TestCase):
                      patch.object(crawl_from_db, "async_playwright", return_value=manager), \
                      patch.object(crawl_from_db, "scrape_other_offer_page", new=AsyncMock(return_value=rows)) as scrape:
                     asyncio.run(crawl_from_db.run())
-                    if crawl_type in (0, "0", None, "default"):
-                        load.assert_not_called()
+                    load.assert_not_called()
                     if expected is None:
                         save.assert_not_called()
                         increment.assert_not_called()
@@ -167,7 +160,7 @@ class CrawlFilterTests(unittest.TestCase):
                         else:
                             scrape.assert_awaited_once_with(context.new_page.return_value, target["url"],
                                                            refresh_unit_prices=True,
-                                                           policies=compile_policies(strategies))
+                                                           enhance_stores=stores)
                         save.assert_called_once_with(10, "g2g", expected, game_product_id=1, version=8)
                         notify.assert_called_once_with(10, 8, len(expected))
                         update.assert_called_once_with(10)
