@@ -1,0 +1,38 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "同步爬虫 skill：创建",
+      "description": "代理改动爬虫源码后同步已确认的项目规范，排除规范文件以防递归。",
+      "trigger": "PostFileCreate",
+      "matcher": "^(?!.*(?:^|/)(?:venv|\\.git|\\.kiro|\\.codebuddy|logs|downloads|__pycache__)/)(?:.*/)?(?:g2g/.*\\.py|tools/.*\\.py|tests/.*\\.py|sql/.*\\.sql|main\\.py|[^/]+\\.sh|requirements[^/]*\\.txt|pyproject\\.toml|\\.env(?:\\.prod)?(?:\\.example)?)$",
+      "action": {
+        "type": "agent",
+        "prompt": "爬虫项目的相关文件已被代理创建、保存或删除。读取项目根目录 AGENTS.md 和 .kiro/skills/g2g-crawl-dev/SKILL.md，结合本次文件事件、当前任务已完成改动、相关最终源码及 git diff，直接同步受影响的稳定约定：配置默认值、平台抓取上限、分类分流、数据库字段与关联、分片与间隔、加强名单优先级、空名单 Top3、详情价格归属、快照版本、通知顺序、失败行为、进程锁、日志和启动方式。涉及独立抓取/登录/会话/导出工具时另读取并维护 .codebuddy/skills/g2g-scraper/SKILL.md。替换过时段落，不追加改动流水账；文件删除时检查引用。只写已确认的源码行为，不把未完成中间状态或未经验证的服务器状态写成事实。不要把 .env 的数据库密码、账号、令牌、会话或业务数据写入规范。纯格式或规则仍准确时核对即可。此 hook 只修改相关 skill，不修改业务代码，不执行部署、迁移或真实平台写操作，不提交或推送。规范与 hook 文件自身不触发本 hook。完成后简要说明更新范围或无需更新的原因。"
+      },
+      "enabled": true
+    },
+    {
+      "name": "同步爬虫 skill：保存",
+      "description": "代理改动爬虫源码后同步已确认的项目规范，排除规范文件以防递归。",
+      "trigger": "PostFileSave",
+      "matcher": "^(?!.*(?:^|/)(?:venv|\\.git|\\.kiro|\\.codebuddy|logs|downloads|__pycache__)/)(?:.*/)?(?:g2g/.*\\.py|tools/.*\\.py|tests/.*\\.py|sql/.*\\.sql|main\\.py|[^/]+\\.sh|requirements[^/]*\\.txt|pyproject\\.toml|\\.env(?:\\.prod)?(?:\\.example)?)$",
+      "action": {
+        "type": "agent",
+        "prompt": "爬虫项目的相关文件已被代理创建、保存或删除。读取项目根目录 AGENTS.md 和 .kiro/skills/g2g-crawl-dev/SKILL.md，结合本次文件事件、当前任务已完成改动、相关最终源码及 git diff，直接同步受影响的稳定约定：配置默认值、平台抓取上限、分类分流、数据库字段与关联、分片与间隔、加强名单优先级、空名单 Top3、详情价格归属、快照版本、通知顺序、失败行为、进程锁、日志和启动方式。涉及独立抓取/登录/会话/导出工具时另读取并维护 .codebuddy/skills/g2g-scraper/SKILL.md。替换过时段落，不追加改动流水账；文件删除时检查引用。只写已确认的源码行为，不把未完成中间状态或未经验证的服务器状态写成事实。不要把 .env 的数据库密码、账号、令牌、会话或业务数据写入规范。纯格式或规则仍准确时核对即可。此 hook 只修改相关 skill，不修改业务代码，不执行部署、迁移或真实平台写操作，不提交或推送。规范与 hook 文件自身不触发本 hook。完成后简要说明更新范围或无需更新的原因。"
+      },
+      "enabled": true
+    },
+    {
+      "name": "同步爬虫 skill：删除",
+      "description": "代理改动爬虫源码后同步已确认的项目规范，排除规范文件以防递归。",
+      "trigger": "PostFileDelete",
+      "matcher": "^(?!.*(?:^|/)(?:venv|\\.git|\\.kiro|\\.codebuddy|logs|downloads|__pycache__)/)(?:.*/)?(?:g2g/.*\\.py|tools/.*\\.py|tests/.*\\.py|sql/.*\\.sql|main\\.py|[^/]+\\.sh|requirements[^/]*\\.txt|pyproject\\.toml|\\.env(?:\\.prod)?(?:\\.example)?)$",
+      "action": {
+        "type": "agent",
+        "prompt": "爬虫项目的相关文件已被代理创建、保存或删除。读取项目根目录 AGENTS.md 和 .kiro/skills/g2g-crawl-dev/SKILL.md，结合本次文件事件、当前任务已完成改动、相关最终源码及 git diff，直接同步受影响的稳定约定：配置默认值、平台抓取上限、分类分流、数据库字段与关联、分片与间隔、加强名单优先级、空名单 Top3、详情价格归属、快照版本、通知顺序、失败行为、进程锁、日志和启动方式。涉及独立抓取/登录/会话/导出工具时另读取并维护 .codebuddy/skills/g2g-scraper/SKILL.md。替换过时段落，不追加改动流水账；文件删除时检查引用。只写已确认的源码行为，不把未完成中间状态或未经验证的服务器状态写成事实。不要把 .env 的数据库密码、账号、令牌、会话或业务数据写入规范。纯格式或规则仍准确时核对即可。此 hook 只修改相关 skill，不修改业务代码，不执行部署、迁移或真实平台写操作，不提交或推送。规范与 hook 文件自身不触发本 hook。完成后简要说明更新范围或无需更新的原因。"
+      },
+      "enabled": true
+    }
+  ]
+}
