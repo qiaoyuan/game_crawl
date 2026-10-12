@@ -35,9 +35,10 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 
 ## 任务、分片与快照
 
-- `get_pending_targets` 查询启用、未删除、`crawl_server` 相同的目标，按 `MOD(id, worker_count)=worker_index` 分片并按 id 排序。worker index 从 0 开始，必须小于正数 worker count。
+- `get_pending_targets` 查询启用、未删除、`crawl_server` 相同的目标，按 `MOD(id, worker_count)=worker_index` 分片并按 id 排序。worker index 从 0 开始，必须小于正数 worker count。该分片不保证任务数量或耗时均衡；每个 worker 内仍串行抓取，`iter_scheduled_targets` 调整本轮执行顺序，不增加目标并发或改变分片 SQL。
 - 跳过无有效 `game_product_id`、无 URL 的任务。`crawl_interval` 是两次开始的最小间隔（秒），30 表示开始间隔 30 秒，不额外叠加基础 30 秒；0/缺失表示每轮调度执行，首次抓取不等待。Python 在版本递增前记录本轮开始时间，完整保存后将该时间写入 `last_crawl_at`，下次到期时间为上次成功轮次的开始时间加间隔，抓取耗时不追加到间隔中。
-- 已到期立即执行；距到期不超过 30 秒时使用异步 sleep 等到期后在本轮执行，不提前抓取；剩余超过 30 秒才跳过。日志区分等待和跳过，格式错误的历史时间仍告警后继续抓取。旧版本保存的完成时间无需迁移，首个成功轮次后自然换成开始时间。
+- 先排除无产品或 URL 的任务，再依据本轮任务快照计算到期时间。每个目标结束后重新扫描未执行队列，优先选择已经到期的目标；同时到期的目标保持原 id 顺序。未到期目标暂留队列，不在原位置等待并阻塞后面的已到期目标。
+- 仅当队列没有已到期目标时，选择最近到期者：剩余不超过 30 秒则异步 sleep，醒来后重新检查到期时间，避免提前执行；最近目标仍超过 30 秒则记录并跳过所有剩余目标。初始剩余超过 30 秒的目标可能在其他目标抓取期间到期，因此不在首次扫描时直接删除。每个目标本轮最多尝试一次，失败不在本轮重新排队。日志区分到期优先、等待和跳过，格式错误的历史时间仍告警后继续抓取。该等待阈值不是整轮耗时上限，仍可能多次等待不同目标。旧版本保存的完成时间无需迁移，首个成功轮次后自然换成开始时间。
 - `crawl_type`：0 默认，1 店铺加强；兼容数字字符串、历史 `default/top3`，缺失/空值按 0，未知类型报错。
 - 每个目标抓取前递增 `crawl_target.version`，本轮所有 `crawl_data` 带同一 `target_id`、`game_product_id` 和 version。加强失败仍可能已递增版本。
 - 成功顺序：保存完整候选 → 更新 `last_crawl_at` → 插入 `crawl_notify(status=0)`，通知带目标、准确 version、实际保存条数。成功零条也可发零条通知。PHP 按通知 version 读取快照，不能只读最新版本。
@@ -73,6 +74,7 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 - 清理复用 `crawl.lock`，最多等待 30 秒；爬虫或另一清理进程持续持锁时输出跳过并返回 0，其他 IO/压缩错误返回非零，压缩未成功时不截断源日志。持锁期间生产 worker 不运行；绕过启动脚本的写入不受保护，启动触发的锁等待/跳过日志仍可能与 `crawl.log` 的复制截断并发，极短窗口内这些行可能丢失。`crawl.lock`、`crawl_wait.lock` 均不删除。`--dry-run` 仅预览日志操作（仍获取运行锁，缺少锁文件时会创建它）。
 - 参数 `--max-mb`、`--keep`、`--days` 接受正整数，默认 20/3/7；`--wait-seconds` 接受非负整数，默认 30；`--log-dir` 可覆盖日志目录。`cron/crawl-log-cleanup` 提供 Linux root 的 `/etc/cron.d` 配置，每小时第 17 分钟执行一次，输出交给 cron，不额外写清理日志。上传后以 root 将它复制到 `/etc/cron.d/crawl-log-cleanup` 并设权限 644 才会启用；宝塔可等价配置每小时运行 `bash /www/wwwroot/game_crawl/cleanup_logs.sh`。不要重复安装两种调度。清理按检查时刻执行且忙时可能跳过，不能宣称文件大小始终硬限制在 20 MiB，也不能将本地配置当成线上已安装。
 - 日志区分 ELD API 请求模式和按需启动 Chromium 的原因；单目标完成/失败耗时从类型与策略处理开始，包含资源初始化、抓取和数据库操作，不含目标间隔等待。worker 耗时从 run 开始到资源清理结束，包含数据库任务读取与间隔等待，不含 Python 模块导入或 Xvfb 启动。shell 汇总按顺序 wait 的完成日志不能当作各 worker 的真实结束时刻，排查耗时优先看 worker 自身日志。
+- `timed_stage` 使用单调计时输出并立即刷新阶段开始、完成或失败日志，原始异常继续向上传递。资源初始化分别记录 Playwright driver、Chromium、G2G context/page，仅在实际创建时记录，复用不重复计为启动。G2G 通用卡片路径（物品等）分别记录页面导航、货币检查、必要时 USD 切换重导航、首批卡片加载、固定 3 秒稳定等待、列表数量检查/滚动、页面货币解析、卡片提取及 Python 数据过滤/价格解析。阶段计时不改变既有等待、选择器、抓取上限或价格来源；金币/游戏币详情加强仍使用既有逐店阶段日志。阶段日志用于定位耗时，不代表已确定真实网站的瓶颈或整轮一定缩短到 30 秒。
 - `deploy_prod.sh` 会 rsync、安装依赖和验证环境，属于真实部署；其帮助文字可能滞后，以启动脚本为准。维护规范不等于运行部署。迁移文件存在也不代表已执行；有字段变更时同步后台模型、验证、UI 和迁移。
 
 ## 验证与规范维护
@@ -85,7 +87,7 @@ rtk proxy bash -n run_crawl_and_consume.sh
 rtk git diff --check
 ```
 
-`test_other_offer_prices.py` 覆盖加强选择、异步价格归属、列表上限与各 DOM 路径的全局排除；`test_eldorado_limit.py` 覆盖独立 ELD 上限、第一页、价格解析前排除及全部排除时不回退 DOM；`test_crawl_excluded_stores.py` 覆盖多名字/ID 归一化完整匹配、空配置、默认与加强类型在价格处理前排除、剩余候选入库及通知条数；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_interval.py` 用模拟时钟覆盖连续三轮 ELD 目标、抓取耗时与提前触发、等待/跳过边界、失败不推进时间及开始时间持久化；`test_crawl_workers.py` 覆盖分片、dotenv 进程数加载、环境变量覆盖、非法值拒绝、配置不执行、等锁成功/超时/错误及失败汇总，并以操作系统 flock 验证一轮运行、一个等待者、额外触发退出和两轮无重叠。`test_crawl_session.py` 覆盖 ELD 纯 API 完整保存与通知、全部排除时零条成功、不需执行时不启动 driver、混合目标复用浏览器与 ELD context 隔离、API 错误/空结果/无法解析 URL 的 DOM 兜底、失败目标不通知且继续后续目标、资源释放；通过本地 HTTP 服务与真实 Playwright 验证独立请求无需 Chromium，不能将其当作真实平台线上验证。
+`test_other_offer_prices.py` 覆盖加强选择、异步价格归属、列表上限与各 DOM 路径的全局排除；`test_eldorado_limit.py` 覆盖独立 ELD 上限、第一页、价格解析前排除及全部排除时不回退 DOM；`test_crawl_excluded_stores.py` 覆盖多名字/ID 归一化完整匹配、空配置、默认与加强类型在价格处理前排除、剩余候选入库及通知条数；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_interval.py` 用模拟时钟覆盖连续三轮 ELD 目标、抓取耗时与提前触发、已到期目标绕过队列前部等待、最近到期者优先、目标处理后重新判断到期、提前唤醒不提前抓取、无效任务及历史时间、等待/跳过边界、失败不推进时间及开始时间持久化；`test_crawl_timing.py` 覆盖页面导航/卡片等待/提取的独立计时、阶段失败保留原始异常、driver/browser/page 初始化独立计时及复用不重复计时。`test_crawl_workers.py` 覆盖分片、dotenv 进程数加载、环境变量覆盖、非法值拒绝、配置不执行、等锁成功/超时/错误及失败汇总，并以操作系统 flock 验证一轮运行、一个等待者、额外触发退出和两轮无重叠。`test_crawl_session.py` 覆盖 ELD 纯 API 完整保存与通知、全部排除时零条成功、不需执行时不启动 driver、混合目标复用浏览器与 ELD context 隔离、API 错误/空结果/无法解析 URL 的 DOM 兜底、失败目标不通知且继续后续目标、资源释放；通过本地 HTTP 服务与真实 Playwright 验证独立请求无需 Chromium，不能将其当作真实平台线上验证。
 
 `test_cleanup_logs.py` 覆盖压缩内容、原地截断后已有追加句柄继续写入、备份数量和过期清理、文件范围及符号链接排除、预览无日志修改、压缩落盘失败保留原日志，以及真实跨进程运行锁阻止清理。
 

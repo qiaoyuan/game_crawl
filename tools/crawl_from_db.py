@@ -11,7 +11,7 @@ import json
 import math
 import re
 import time
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, contextmanager
 from datetime import datetime
 from time import perf_counter
 from playwright.async_api import async_playwright
@@ -101,231 +101,254 @@ def parse_rating(text: str | None) -> str | None:
         return None
 
 
+@contextmanager
+def timed_stage(label):
+    """记录阶段开始及成功/失败耗时，停滞时也能看到当前阶段。"""
+    print(f"  -> 阶段开始: {label}", flush=True)
+    started = perf_counter()
+    try:
+        yield
+    except BaseException:
+        print(f"  -> 阶段失败: {label}，耗时: {perf_counter() - started:.2f} 秒", flush=True)
+        raise
+    else:
+        print(f"  -> 阶段完成: {label}，耗时: {perf_counter() - started:.2f} 秒", flush=True)
+
+
 async def scrape_page(page, url: str) -> list:
     """爬取单个页面的产品卡片"""
     offer_limit = config.CRAWL_OFFER_LIMIT
     print(f"  [*] 打开: {url}")
-    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-    # 兜底：如果 g2g_regional cookie 货币不是 USD，用 JS 设 cookie 后刷新
-    currency_check = await page.evaluate("""() => {
-        const m = document.cookie.match(/g2g_regional=([^;]+)/);
-        if (m) {
-            try { return JSON.parse(decodeURIComponent(m[1])).currency; } catch(_) {}
-        }
-        return null;
-    }""")
-    if currency_check and currency_check != "USD":
-        print(f"  [!] 检测到货币 {currency_check}，强制切换为 USD 并刷新...")
-        await page.evaluate("""() => {
-            document.cookie = 'g2g_regional=%7B%22country%22%3A%22US%22%2C%22language%22%3A%22en%22%2C%22currency%22%3A%22USD%22%7D; path=/; domain=.g2g.com; max-age=86400';
-        }""")
+    with timed_stage("G2G 页面导航"):
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
+    # 兜底：如果 g2g_regional cookie 货币不是 USD，用 JS 设 cookie 后刷新
+    with timed_stage("G2G 货币检查"):
+        currency_check = await page.evaluate("""() => {
+            const m = document.cookie.match(/g2g_regional=([^;]+)/);
+            if (m) {
+                try { return JSON.parse(decodeURIComponent(m[1])).currency; } catch(_) {}
+            }
+            return null;
+        }""")
+    if currency_check and currency_check != "USD":
+        print(f"  [!] 检测到货币 {currency_check}，强制切换为 USD 并刷新...")
+        with timed_stage("G2G USD 切换与重新导航"):
+            await page.evaluate("""() => {
+                document.cookie = 'g2g_regional=%7B%22country%22%3A%22US%22%2C%22language%22%3A%22en%22%2C%22currency%22%3A%22USD%22%7D; path=/; domain=.g2g.com; max-age=86400';
+            }""")
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
     # 等待卡片加载
-    for i in range(60):
-        cards = await page.query_selector_all('[aria-label="Product Card"]')
-        if len(cards) > 0:
-            break
-        await asyncio.sleep(1)
-    await asyncio.sleep(3)
+    with timed_stage("G2G 首批卡片加载"):
+        for i in range(60):
+            cards = await page.query_selector_all('[aria-label="Product Card"]')
+            if len(cards) > 0:
+                break
+            await asyncio.sleep(1)
+    with timed_stage("G2G 卡片稳定等待（固定 3 秒）"):
+        await asyncio.sleep(3)
 
     # 滚动加载
-    prev_count = 0
-    for s in range(10):
-        count = len(await page.query_selector_all('[aria-label="Product Card"]'))
-        if count >= offer_limit:
-            break
-        if count == prev_count:
-            break
-        prev_count = count
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(2)
+    with timed_stage("G2G 列表数量检查与滚动加载"):
+        prev_count = 0
+        for s in range(10):
+            count = len(await page.query_selector_all('[aria-label="Product Card"]'))
+            if count >= offer_limit:
+                break
+            if count == prev_count:
+                break
+            prev_count = count
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(2)
 
     # ========== 先提取页面级别货币（全局指示器） ==========
-    page_currency = await page.evaluate("""
-        (() => {
-            // 方法1: G2G 页面顶部货币选择器
-            const currencyBtn = document.querySelector('[data-testid="currency-selector"]')
-                || document.querySelector('[class*="currency"] button')
-                || document.querySelector('button[class*="Currency"]');
-            if (currencyBtn) return currencyBtn.innerText.trim().split(/\\s+/)[0];
+    with timed_stage("G2G 页面货币解析"):
+        page_currency = await page.evaluate("""
+            (() => {
+                // 方法1: G2G 页面顶部货币选择器
+                const currencyBtn = document.querySelector('[data-testid="currency-selector"]')
+                    || document.querySelector('[class*="currency"] button')
+                    || document.querySelector('button[class*="Currency"]');
+                if (currencyBtn) return currencyBtn.innerText.trim().split(/\\s+/)[0];
 
-            // 方法2: 查找页面上的 "All prices in XXX" 提示
-            const banners = document.body.innerText.match(/All prices (?:are )?in\\s+([A-Z]{3})/i);
-            if (banners) return banners[1].toUpperCase();
+                // 方法2: 查找页面上的 "All prices in XXX" 提示
+                const banners = document.body.innerText.match(/All prices (?:are )?in\\s+([A-Z]{3})/i);
+                if (banners) return banners[1].toUpperCase();
 
-            // 方法3: 查找任意货币代码文本
-            const currencyMatch = document.body.innerText.match(/(?:Prices? (?:in|are in)|Currency[：:]\\s*)([A-Z]{3})/i);
-            if (currencyMatch) return currencyMatch[1].toUpperCase();
+                // 方法3: 查找任意货币代码文本
+                const currencyMatch = document.body.innerText.match(/(?:Prices? (?:in|are in)|Currency[：:]\\s*)([A-Z]{3})/i);
+                if (currencyMatch) return currencyMatch[1].toUpperCase();
 
-            return null;
-        })()
-    """)
+                return null;
+            })()
+        """)
     if page_currency:
         print(f"  [*] 页面货币: {page_currency}")
     else:
         print(f"  [*] 未检测到页面级别货币，将从每个卡片价格文本解析")
 
     # 提取数据
-    items_raw = await page.evaluate("""
-        limit => {
-            const VALID_CURRENCY_CODES = new Set([
-                'USD','SGD','EUR','GBP','AUD','CAD','JPY','CNY','HKD','MYR','KRW','INR','THB','PHP','IDR','CHF','NZD','BRL','SEK','NOK','DKK','PLN','AED','SAR'
-            ]);
+    with timed_stage("G2G 卡片数据提取"):
+        items_raw = await page.evaluate("""
+            limit => {
+                const VALID_CURRENCY_CODES = new Set([
+                    'USD','SGD','EUR','GBP','AUD','CAD','JPY','CNY','HKD','MYR','KRW','INR','THB','PHP','IDR','CHF','NZD','BRL','SEK','NOK','DKK','PLN','AED','SAR'
+                ]);
 
-            const cards = Array.from(document.querySelectorAll('[aria-label="Product Card"]')).slice(0, limit);
-            const results = [];
-            cards.forEach(card => {
-                const item = {};
+                const cards = Array.from(document.querySelectorAll('[aria-label="Product Card"]')).slice(0, limit);
+                const results = [];
+                cards.forEach(card => {
+                    const item = {};
 
-                // 卖家链接（不含 /offer/ 的 g2g.com/ 链接）
-                const sellerLink = card.querySelector('a[href*="g2g.com/"]:not([href*="offer"]):not([href*="categories"])');
-                if (sellerLink) {
-                    const href = sellerLink.getAttribute('href') || '';
-                    const match = href.match(/g2g\\.com\\/([A-Za-z0-9_-]+)$/);
-                    if (match) item.seller_id = match[1];
-                    item.seller_url = href;
-                }
-                // 卖家名
-                const sellerNameEl = card.querySelector('.truncate.text-xs.font-medium');
-                if (sellerNameEl) item.seller_name = sellerNameEl.innerText.trim();
-                // 卖家等级
-                let levelEl = card.querySelector('.text-\\\\[10px\\\\].leading-3.font-medium');
-                if (!levelEl) levelEl = card.querySelector('[class*="text-\\\\[10px"]');
-                if (levelEl) item.seller_level = levelEl.innerText.trim();
-
-                // 产品标题
-                const titleEl = card.querySelector('.line-clamp-2');
-                if (titleEl) item.product_title = titleEl.innerText.trim();
-
-                // Chips: 已售/库存/最小起订/配送时间
-                const chips = card.querySelectorAll('.h-chip__content');
-                chips.forEach(chip => {
-                    const t = chip.innerText.trim();
-                    if (!t) return;
-                    // 好评率如 "100%"
-                    if (/^\\d{1,3}%$/.test(t)) {
-                        item.rating = t;
+                    // 卖家链接（不含 /offer/ 的 g2g.com/ 链接）
+                    const sellerLink = card.querySelector('a[href*="g2g.com/"]:not([href*="offer"]):not([href*="categories"])');
+                    if (sellerLink) {
+                        const href = sellerLink.getAttribute('href') || '';
+                        const match = href.match(/g2g\\.com\\/([A-Za-z0-9_-]+)$/);
+                        if (match) item.seller_id = match[1];
+                        item.seller_url = href;
                     }
-                    // 已售出 / Sold
-                    else if (/Sold|sold|\\u5df2\\u552e/.test(t)) {
-                        item.sold_count = t;
-                    }
-                    // 库存（纯数字+可选k/m后缀，排除带中文/字母的）
-                    else if (/^[\\d.,]+[kKmM]?$/.test(t) && !/[^\\d.,kKmM]/.test(t)) {
-                        item.stock = t;
-                    }
-                    // 最小起订
-                    else if (/^Min|^min|^\\u6700\\u5c0f/.test(t)) {
-                        item.min_order = t;
-                    }
-                    // 配送时间
-                    else if (/\\d+\\s*(\\u5206\\u949f|\\u5c0f\\u65f6|Mins?|Hours?|Hr|Minute|Hour)/i.test(t)) {
-                        item.delivery_time = t;
-                    }
-                });
+                    // 卖家名
+                    const sellerNameEl = card.querySelector('.truncate.text-xs.font-medium');
+                    if (sellerNameEl) item.seller_name = sellerNameEl.innerText.trim();
+                    // 卖家等级
+                    let levelEl = card.querySelector('.text-\\\\[10px\\\\].leading-3.font-medium');
+                    if (!levelEl) levelEl = card.querySelector('[class*="text-\\\\[10px"]');
+                    if (levelEl) item.seller_level = levelEl.innerText.trim();
 
-                // ====== 价格 & 货币 — 适配新旧两种卡片结构 ======
-                // 新结构: <span class="text-base font-bold">0.003317</span> <span class="text-xs font-medium">CNY</span>
-                // 旧结构: 价格文本含符号如 "S$ 12.50"
-                const priceEl = card.querySelector('.text-base.font-bold');
-                if (priceEl) {
-                    const priceText = priceEl.innerText.trim();
+                    // 产品标题
+                    const titleEl = card.querySelector('.line-clamp-2');
+                    if (titleEl) item.product_title = titleEl.innerText.trim();
 
-                    // 先尝试从价格文本本身解析货币（旧结构，如 "S$ 12.50"）
-                    const symbolMatch = priceText.match(/^(US\\$|S\\$|A\\$|C\\$|HK\\$|NZ\\$|CN\\u00a5|RM|Rp|R\\$|\\u20ac|\\u00a3|\\u00a5|\\u20a9|\\u20b9|\\u0e3f|\\u20b1|CHF|\\$)?\\s*([\\d.,]+)/);
-                    if (symbolMatch && symbolMatch[1] && symbolMatch[1].length > 0) {
-                        // 旧结构：价格文本自带货币符号
-                        item.price_raw = symbolMatch[2];
-                        item.currency_from_price = symbolMatch[1];
-                    } else {
-                        // 新结构：价格是纯数字，货币在兄弟元素
-                        item.price_raw = priceText;
-                        // 找价格所在容器的兄弟货币标签
-                        const priceContainer = priceEl.closest('.flex.flex-wrap') || priceEl.parentElement;
-                        if (priceContainer) {
-                            const currencySibling = priceContainer.querySelector('.text-xs.font-medium')
-                                || priceContainer.querySelector('[class*="text-xs"][class*="font-medium"]');
-                            if (currencySibling) {
-                                const curText = currencySibling.innerText.trim();
-                                if (curText.length <= 5 && !/^\\d/.test(curText)) {
-                                    item.currency_label = curText;
+                    // Chips: 已售/库存/最小起订/配送时间
+                    const chips = card.querySelectorAll('.h-chip__content');
+                    chips.forEach(chip => {
+                        const t = chip.innerText.trim();
+                        if (!t) return;
+                        // 好评率如 "100%"
+                        if (/^\\d{1,3}%$/.test(t)) {
+                            item.rating = t;
+                        }
+                        // 已售出 / Sold
+                        else if (/Sold|sold|\\u5df2\\u552e/.test(t)) {
+                            item.sold_count = t;
+                        }
+                        // 库存（纯数字+可选k/m后缀，排除带中文/字母的）
+                        else if (/^[\\d.,]+[kKmM]?$/.test(t) && !/[^\\d.,kKmM]/.test(t)) {
+                            item.stock = t;
+                        }
+                        // 最小起订
+                        else if (/^Min|^min|^\\u6700\\u5c0f/.test(t)) {
+                            item.min_order = t;
+                        }
+                        // 配送时间
+                        else if (/\\d+\\s*(\\u5206\\u949f|\\u5c0f\\u65f6|Mins?|Hours?|Hr|Minute|Hour)/i.test(t)) {
+                            item.delivery_time = t;
+                        }
+                    });
+
+                    // ====== 价格 & 货币 — 适配新旧两种卡片结构 ======
+                    // 新结构: <span class="text-base font-bold">0.003317</span> <span class="text-xs font-medium">CNY</span>
+                    // 旧结构: 价格文本含符号如 "S$ 12.50"
+                    const priceEl = card.querySelector('.text-base.font-bold');
+                    if (priceEl) {
+                        const priceText = priceEl.innerText.trim();
+
+                        // 先尝试从价格文本本身解析货币（旧结构，如 "S$ 12.50"）
+                        const symbolMatch = priceText.match(/^(US\\$|S\\$|A\\$|C\\$|HK\\$|NZ\\$|CN\\u00a5|RM|Rp|R\\$|\\u20ac|\\u00a3|\\u00a5|\\u20a9|\\u20b9|\\u0e3f|\\u20b1|CHF|\\$)?\\s*([\\d.,]+)/);
+                        if (symbolMatch && symbolMatch[1] && symbolMatch[1].length > 0) {
+                            // 旧结构：价格文本自带货币符号
+                            item.price_raw = symbolMatch[2];
+                            item.currency_from_price = symbolMatch[1];
+                        } else {
+                            // 新结构：价格是纯数字，货币在兄弟元素
+                            item.price_raw = priceText;
+                            // 找价格所在容器的兄弟货币标签
+                            const priceContainer = priceEl.closest('.flex.flex-wrap') || priceEl.parentElement;
+                            if (priceContainer) {
+                                const currencySibling = priceContainer.querySelector('.text-xs.font-medium')
+                                    || priceContainer.querySelector('[class*="text-xs"][class*="font-medium"]');
+                                if (currencySibling) {
+                                    const curText = currencySibling.innerText.trim();
+                                    if (curText.length <= 5 && !/^\\d/.test(curText)) {
+                                        item.currency_label = curText;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                const offerLink = card.querySelector('a[href*="/offer/"]');
-                if (offerLink) item.offer_url = offerLink.href;
-                const avatarEl = card.querySelector('img.h-img__image');
-                if (avatarEl) item.avatar = avatarEl.src;
-                const onlineEl = card.querySelector('.h-user-avatar__online-indicator');
-                item.is_online = !!onlineEl;
-                results.push(item);
-            });
-            return results;
-        }
-    """, offer_limit)
+                    const offerLink = card.querySelector('a[href*="/offer/"]');
+                    if (offerLink) item.offer_url = offerLink.href;
+                    const avatarEl = card.querySelector('img.h-img__image');
+                    if (avatarEl) item.avatar = avatarEl.src;
+                    const onlineEl = card.querySelector('.h-user-avatar__online-indicator');
+                    item.is_online = !!onlineEl;
+                    results.push(item);
+                });
+                return results;
+            }
+        """, offer_limit)
 
     # ========== Python 侧货币解析：优先从页面实际内容提取 ==========
-    items = []
-    for raw in filter_excluded_stores(items_raw):
-        item = {k: v for k, v in raw.items()}
+    with timed_stage("G2G 数据过滤与价格解析"):
+        items = []
+        for raw in filter_excluded_stores(items_raw):
+            item = {k: v for k, v in raw.items()}
 
-        price_raw = raw.get("price_raw", "")
-        currency_from_price = raw.get("currency_from_price", "")     # JS 从价格文本解析出的符号
-        currency_label = raw.get("currency_label", "")               # JS 从兄弟元素提取的标签
+            price_raw = raw.get("price_raw", "")
+            currency_from_price = raw.get("currency_from_price", "")     # JS 从价格文本解析出的符号
+            currency_label = raw.get("currency_label", "")               # JS 从兄弟元素提取的标签
 
-        parsed_currency = None
+            parsed_currency = None
 
-        # 1. 如果 JS 已经从价格文本解析出货币符号（旧结构），直接映射
-        if currency_from_price:
-            cs = currency_from_price.strip()
-            # 先检查是否为3字母货币代码
-            if cs.upper() in {"USD", "SGD", "EUR", "GBP", "AUD", "CAD", "JPY", "CNY", "HKD", "MYR", "KRW", "INR", "THB", "PHP", "IDR", "CHF", "NZD", "BRL"}:
-                parsed_currency = cs.upper()
-            else:
-                # 从符号映射表中查找
-                sorted_syms = sorted(CURRENCY_SYMBOL_MAP.keys(), key=len, reverse=True)
-                for sym in sorted_syms:
-                    if cs.startswith(sym):
-                        parsed_currency = CURRENCY_SYMBOL_MAP[sym]
-                        break
+            # 1. 如果 JS 已经从价格文本解析出货币符号（旧结构），直接映射
+            if currency_from_price:
+                cs = currency_from_price.strip()
+                # 先检查是否为3字母货币代码
+                if cs.upper() in {"USD", "SGD", "EUR", "GBP", "AUD", "CAD", "JPY", "CNY", "HKD", "MYR", "KRW", "INR", "THB", "PHP", "IDR", "CHF", "NZD", "BRL"}:
+                    parsed_currency = cs.upper()
+                else:
+                    # 从符号映射表中查找
+                    sorted_syms = sorted(CURRENCY_SYMBOL_MAP.keys(), key=len, reverse=True)
+                    for sym in sorted_syms:
+                        if cs.startswith(sym):
+                            parsed_currency = CURRENCY_SYMBOL_MAP[sym]
+                            break
 
-        # 2. 如果 JS 提取了卡片内的货币标签（新结构），直接用
-        if not parsed_currency and currency_label:
-            cl = currency_label.strip().upper()
-            if cl in {"USD", "SGD", "EUR", "GBP", "AUD", "CAD", "JPY", "CNY", "HKD", "MYR", "KRW", "INR", "THB", "PHP", "IDR", "CHF", "NZD", "BRL"}:
-                parsed_currency = cl
+            # 2. 如果 JS 提取了卡片内的货币标签（新结构），直接用
+            if not parsed_currency and currency_label:
+                cl = currency_label.strip().upper()
+                if cl in {"USD", "SGD", "EUR", "GBP", "AUD", "CAD", "JPY", "CNY", "HKD", "MYR", "KRW", "INR", "THB", "PHP", "IDR", "CHF", "NZD", "BRL"}:
+                    parsed_currency = cl
 
-        # 3. 回退到 Python 侧从价格文本解析
-        if not parsed_currency:
-            p_cur, _ = parse_currency_from_price(price_raw)
-            parsed_currency = p_cur
+            # 3. 回退到 Python 侧从价格文本解析
+            if not parsed_currency:
+                p_cur, _ = parse_currency_from_price(price_raw)
+                parsed_currency = p_cur
 
-        # 4. 回退到页面级别货币
-        if not parsed_currency:
-            parsed_currency = page_currency
+            # 4. 回退到页面级别货币
+            if not parsed_currency:
+                parsed_currency = page_currency
 
-        # 5. 最终回退
-        if not parsed_currency:
-            parsed_currency = "USD"
+            # 5. 最终回退
+            if not parsed_currency:
+                parsed_currency = "USD"
 
-        item["currency"] = parsed_currency
-        item["price"] = price_raw
+            item["currency"] = parsed_currency
+            item["price"] = price_raw
 
-        # 好评率：去掉 % 号，统一保留两位小数的字符串，如 "96.00"
-        rating_raw = item.get("rating", "")
-        item["rating"] = parse_rating(rating_raw)
+            # 好评率：去掉 % 号，统一保留两位小数的字符串，如 "96.00"
+            rating_raw = item.get("rating", "")
+            item["rating"] = parse_rating(rating_raw)
 
-        # 清理临时字段
-        item.pop("price_raw", None)
-        item.pop("currency_from_price", None)
-        item.pop("currency_label", None)
+            # 清理临时字段
+            item.pop("price_raw", None)
+            item.pop("currency_from_price", None)
+            item.pop("currency_label", None)
 
-        items.append(item)
+            items.append(item)
 
     return items
 
@@ -988,21 +1011,27 @@ async def scrape_eldorado_dom(page, url: str) -> list:
     return items
 
 
-async def wait_for_crawl_interval(target, label):
-    """临近到期时等到本轮执行，避免 cron 秒级偏差造成整轮跳过。"""
+def crawl_interval_deadline(target, label):
+    """将本轮任务快照的开始间隔转换为绝对到期时间；0 表示立即可执行。"""
     last_crawl_at = target.get("last_crawl_at")
     try:
         interval_seconds = max(0, int(target.get("crawl_interval") or 0))
         if not interval_seconds or not last_crawl_at:
-            return True
+            return 0, interval_seconds
         last_started_at = (
             last_crawl_at if isinstance(last_crawl_at, datetime)
             else datetime.strptime(str(last_crawl_at), "%Y-%m-%d %H:%M:%S")
         )
-        remaining = last_started_at.timestamp() + interval_seconds - time.time()
+        return last_started_at.timestamp() + interval_seconds, interval_seconds
     except (TypeError, ValueError, OverflowError, OSError) as e:
         print(f"  {label} 间隔时间解析异常: {e}，继续执行")
-        return True
+        return 0, 0
+
+
+async def wait_for_crawl_interval(target, label):
+    """单目标兼容入口；生产轮次由 iter_scheduled_targets 避免队列头部等待。"""
+    deadline, interval_seconds = crawl_interval_deadline(target, label)
+    remaining = deadline - time.time()
 
     if remaining <= 0:
         return True
@@ -1019,6 +1048,42 @@ async def wait_for_crawl_interval(target, label):
     )
     await asyncio.sleep(remaining)
     return True
+
+
+async def iter_scheduled_targets(targets, total):
+    """优先执行到期目标；只有队列无到期目标时才等待最近到期者。"""
+    pending = []
+    for idx, target in targets:
+        label = f"[{idx+1}/{total}] {target.get('name', '')}"
+        deadline, interval = crawl_interval_deadline(target, label)
+        pending.append((idx, target, label, deadline, interval))
+
+    while pending:
+        now = time.time()
+        ready = next((entry for entry in pending if entry[3] <= now), None)
+        if ready is not None:
+            if ready is not pending[0]:
+                print(f"  {ready[2]} 调度: 优先执行已到期任务，未到期任务延后")
+            pending.remove(ready)
+            yield ready[0], ready[1]
+            continue
+
+        nearest = min(pending, key=lambda entry: (entry[3], entry[0]))
+        remaining = nearest[3] - now
+        if remaining > 30:
+            for _, _, label, deadline, interval in pending:
+                print(
+                    f"  {label} 跳过: 未到间隔时间，还需等待约 {math.ceil(deadline - now)} 秒"
+                    f"（开始间隔 {interval} 秒）"
+                )
+            return
+
+        print(
+            f"  {nearest[2]} 等待约 {remaining:.1f} 秒后执行"
+            f"（当前无已到期任务，开始间隔 {nearest[4]} 秒）"
+        )
+        await asyncio.sleep(remaining)
+        # 等待可能被提前唤醒，重新核对到期时间，保证不提前抓取。
 
 
 ELDORADO_USER_AGENT = (
@@ -1057,35 +1122,38 @@ class CrawlSession:
 
     async def get_playwright(self):
         if self.playwright is None:
-            self.playwright = await self.resources.enter_async_context(async_playwright())
+            with timed_stage("Playwright 驱动启动"):
+                self.playwright = await self.resources.enter_async_context(async_playwright())
         return self.playwright
 
     async def get_browser(self, reason):
         if self.browser is None:
             playwright = await self.get_playwright()
             print(f"  -> 按需启动 Chromium（{reason}）")
-            self.browser = await playwright.chromium.launch(**config.browser_launch_kwargs())
+            with timed_stage("Chromium 启动"):
+                self.browser = await playwright.chromium.launch(**config.browser_launch_kwargs())
             self.resources.push_async_callback(self.browser.close)
         return self.browser
 
     async def get_g2g_page(self):
         if self.page is None:
             browser = await self.get_browser("G2G 页面抓取")
-            context = await browser.new_context(
-                viewport=config.VIEWPORT,
-                user_agent=config.USER_AGENT,
-            )
-            await context.add_cookies([{
-                "name": "g2g_regional",
-                "value": '{"country":"US","language":"en","currency":"USD"}',
-                "domain": ".g2g.com",
-                "path": "/",
-            }])
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-            """)
-            self.page = await context.new_page()
+            with timed_stage("G2G 上下文与页面初始化"):
+                context = await browser.new_context(
+                    viewport=config.VIEWPORT,
+                    user_agent=config.USER_AGENT,
+                )
+                await context.add_cookies([{
+                    "name": "g2g_regional",
+                    "value": '{"country":"US","language":"en","currency":"USD"}',
+                    "domain": ".g2g.com",
+                    "path": "/",
+                }])
+                await context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    window.chrome = { runtime: {} };
+                """)
+                self.page = await context.new_page()
         return self.page
 
     async def scrape_eldorado(self, url):
@@ -1143,33 +1211,37 @@ async def run(worker_index: int = 0, worker_count: int = 1):
         print("[*] 当前分片没有爬取目标")
         return 0
 
+    valid_targets = []
+    for idx, target in enumerate(targets):
+        try:
+            game_product_id = int(target.get("game_product_id") or 0)
+        except (TypeError, ValueError):
+            game_product_id = 0
+        url = target.get("url")
+        name = target.get("name", "")
+
+        if game_product_id <= 0:
+            print(
+                f"  [{idx+1}/{len(targets)}] {name} 跳过: "
+                f"未关联游戏产品 (game_product_id={game_product_id})"
+            )
+            continue
+
+        if not url:
+            print(f"  [{idx+1}/{len(targets)}] 跳过: 无 URL")
+            continue
+
+        valid_targets.append((idx, target))
+
     async with CrawlSession() as session:
         total_saved = 0
         failed_count = 0
-        for idx, target in enumerate(targets):
+        async for idx, target in iter_scheduled_targets(valid_targets, len(targets)):
             target_id = target.get("id")
-            try:
-                game_product_id = int(target.get("game_product_id") or 0)
-            except (TypeError, ValueError):
-                game_product_id = 0
+            game_product_id = int(target.get("game_product_id"))
             url = target.get("url")
             name = target.get("name", "")
             category = str(target.get("category") or "").strip()
-
-            if game_product_id <= 0:
-                print(
-                    f"  [{idx+1}/{len(targets)}] {name} 跳过: "
-                    f"未关联游戏产品 (game_product_id={game_product_id})"
-                )
-                continue
-
-            if not url:
-                print(f"  [{idx+1}/{len(targets)}] 跳过: 无 URL")
-                continue
-
-            # 间隔按成功轮次的开始时间计算，抓取耗时不再追加到间隔中。
-            if not await wait_for_crawl_interval(target, f"[{idx+1}/{len(targets)}] {name}"):
-                continue
 
             platform = "eldorado" if "eldorado.gg" in url else "g2g"
             category_label = category or "未设置类别"
