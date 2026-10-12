@@ -44,19 +44,20 @@ exec 8>"$LOG_DIR/crawl_wait.lock" || exit 1
 /usr/bin/flock -n 8
 waiter_exit=$?
 if [ "$waiter_exit" -eq 1 ]; then
-    log "已有触发正在等候上一轮，本次触发跳过"
+    log "已有触发正在等候上一调度窗口，本次触发跳过"
     exit 0
 elif [ "$waiter_exit" -ne 0 ]; then
     log "获取爬虫等待锁失败，退出码: $waiter_exit"
     exit "$waiter_exit"
 fi
 
-# 先尝试立即执行；30 秒边界撞锁时等待上一轮退出，不丢掉整轮。
+# cron 仅负责启动和退出后的兜底；窗口内由 Python 按到期时间调度任务。
+# 先尝试立即执行；撞锁时最多等待上一调度窗口退出，不叠加 workers。
 exec 9>"$LOG_DIR/crawl.lock" || exit 1
 /usr/bin/flock -n 9
 lock_exit=$?
 if [ "$lock_exit" -eq 1 ]; then
-    log "上一轮仍在运行，本次触发最多等锁 30 秒"
+    log "上一调度窗口仍在运行，本次触发最多等锁 30 秒"
     /usr/bin/flock -w 30 9
     lock_exit=$?
     if [ "$lock_exit" -eq 1 ]; then
@@ -70,7 +71,7 @@ if [ "$lock_exit" -ne 0 ]; then
 fi
 # 已取得运行锁，释放等待名额；后续子进程只继承运行锁。
 exec 8>&-
-log "开始执行爬虫任务，进程数: $WORKER_COUNT"
+log "开始爬虫调度窗口，进程数: $WORKER_COUNT"
 
 cd /www/wwwroot/game_crawl || {
     log "进入爬虫目录失败"
@@ -90,13 +91,14 @@ for ((worker_index=0; worker_index<WORKER_COUNT; worker_index++)); do
     BROWSER_HEADLESS=0 \
     /www/wwwroot/game_crawl/venv/bin/python -u \
     -m tools.crawl_from_db \
+    --scheduled \
     --worker-count "$WORKER_COUNT" --worker-index "$worker_index" \
     >> "$worker_log" 2>&1 &
     worker_pids+=("$!")
     log "启动 worker=${worker_index}，DISPLAY=自动分配（起始:${display_number}），PID=$!，日志: ${worker_log}，Xvfb日志: ${xvfb_log}"
 done
 
-# 即使一个 worker 失败，也等待本轮另一个结束，再汇总退出状态。
+# 即使一个 worker 失败，也等待调度窗口内所有 worker 结束，再汇总退出状态。
 crawl_exit=0
 for ((worker_index=0; worker_index<WORKER_COUNT; worker_index++)); do
     wait "${worker_pids[$worker_index]}"
@@ -107,12 +109,21 @@ for ((worker_index=0; worker_index<WORKER_COUNT; worker_index++)); do
     fi
 done
 
+# 所有 worker 已退出，仍持有运行锁 fd 9；直接维护日志，避免二次拿锁。
+# 使用固定标准库入口，不加载业务环境配置；维护失败不覆盖爬虫退出码。
+/www/wwwroot/game_crawl/venv/bin/python -c 'from pathlib import Path; from tools.cleanup_logs import cleanup; cleanup(Path("logs"), 20 * 1024 * 1024, 3, 7, False)' \
+    >> "$LOG_FILE" 2>&1
+cleanup_exit=$?
+if [ "$cleanup_exit" -ne 0 ]; then
+    log "调度窗口日志维护失败，退出码: $cleanup_exit"
+fi
+
 elapsed=$((SECONDS - crawl_started_at))
 
 if [ "$crawl_exit" -ne 0 ]; then
-    log "爬虫任务失败，退出码: ${crawl_exit}，本轮耗时: ${elapsed} 秒"
+    log "爬虫调度窗口失败，退出码: ${crawl_exit}，调度窗口耗时: ${elapsed} 秒"
     exit "$crawl_exit"
 fi
 
-log "爬虫任务完成，本轮耗时: ${elapsed} 秒"
+log "爬虫调度窗口完成，调度窗口耗时: ${elapsed} 秒"
 exit 0

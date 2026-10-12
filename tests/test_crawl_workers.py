@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -17,6 +18,15 @@ from tools import crawl_from_db
 
 
 class CrawlWorkerTests(unittest.TestCase):
+    def install_cleanup_runtime(self, directory):
+        """Use the real stdlib cleanup entry point in an isolated production tree."""
+        root = Path(directory)
+        (root / "venv/bin").mkdir(parents=True)
+        (root / "venv/bin/python").symlink_to(sys.executable)
+        (root / "tools").mkdir()
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "tools/cleanup_logs.py",
+                        root / "tools/cleanup_logs.py")
+
     def test_shards_cover_active_targets_once(self):
         with sqlite3.connect(":memory:") as database:
             database.execute(
@@ -69,6 +79,7 @@ class CrawlWorkerTests(unittest.TestCase):
         launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()
         for lock_exit, expected_exit in ((0, 0), (1, 0), (2, 2)):
             with self.subTest(lock_exit=lock_exit), tempfile.TemporaryDirectory() as directory:
+                self.install_cleanup_runtime(directory)
                 script = launcher.replace("/www/wwwroot/game_crawl", directory)
                 script = script.replace("/usr/bin/xvfb-run", "fake_worker")
                 script = script.replace("/usr/bin/flock", "fake_flock")
@@ -88,6 +99,7 @@ fake_worker() {{
                     self.assertEqual(len(calls), 1)
                     self.assertIn("-a -n 90", calls[0])
                     self.assertIn("--worker-count 1 --worker-index 0", calls[0])
+                    self.assertIn("--scheduled --worker-count", calls[0])
                 else:
                     self.assertFalse(events.exists())
 
@@ -95,6 +107,7 @@ fake_worker() {{
         launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()
         for wait_exit, expected_exit in ((0, 0), (1, 0), (2, 2)):
             with self.subTest(wait_exit=wait_exit), tempfile.TemporaryDirectory() as directory:
+                self.install_cleanup_runtime(directory)
                 script = launcher.replace("/www/wwwroot/game_crawl", directory)
                 script = script.replace("/usr/bin/xvfb-run", "fake_worker")
                 script = script.replace("/usr/bin/flock", "fake_flock")
@@ -125,7 +138,28 @@ fake_worker() {{ echo "$*" >> "{directory}/events"; }}
         # Exercise OS flock semantics on Linux/macOS without requiring a flock CLI.
         launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()
         with tempfile.TemporaryDirectory() as directory:
+            self.install_cleanup_runtime(directory)
             root = Path(directory)
+            # The cleanup function must run after workers finish, with the same
+            # fd 9 still inherited and excluding a separate OS lock acquisition.
+            (root / "tools/cleanup_logs.py").write_text('''
+import fcntl
+import os
+from pathlib import Path
+
+def cleanup(directory, max_bytes, keep, days, dry_run):
+    assert (directory, max_bytes, keep, days, dry_run) == (Path("logs"), 20 * 1024 * 1024, 3, 7, False)
+    assert os.fstat(9).st_ino == (directory / "crawl.lock").stat().st_ino
+    with (directory / "crawl.lock").open("a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            raise AssertionError("cleanup lost the crawler lock")
+    with Path("events").open("a") as events:
+        events.write("cleanup " + os.environ["ROUND_NAME"] + "\\n")
+''')
             flock_tool = root / "flock.py"
             flock_tool.write_text('''
 import fcntl
@@ -183,14 +217,16 @@ fake_worker() {{
                 _, errors = third.communicate(timeout=5)
                 self.assertEqual(third.returncode, 0, errors)
                 self.assertEqual((root / "events").read_text().splitlines(), ["start first"])
-                self.assertIn("已有触发正在等候上一轮", (root / "logs/crawl.log").read_text())
+                self.assertIn("已有触发正在等候上一调度窗口", (root / "logs/crawl.log").read_text())
 
                 (root / "release").touch()
                 for process in (first, second):
                     _, errors = process.communicate(timeout=5)
                     self.assertEqual(process.returncode, 0, errors)
                 self.assertEqual((root / "events").read_text().splitlines(),
-                                 ["start first", "done first", "start second", "done second"])
+                                 ["start first", "done first", "cleanup first",
+                                  "start second", "done second", "cleanup second"])
+                self.assertNotIn("日志维护失败", (root / "logs/crawl.log").read_text())
             finally:
                 (root / "release").touch()
                 for process in processes:
@@ -215,6 +251,7 @@ fake_worker() {{
         ]
         for dotenv, override, count in cases:
             with self.subTest(dotenv=dotenv, override=override), tempfile.TemporaryDirectory() as directory:
+                self.install_cleanup_runtime(directory)
                 # Include unrelated shell syntax to verify that loading dotenv never executes it.
                 marker = Path(directory) / "unexpected"
                 (Path(directory) / ".env.prod").write_text(
@@ -239,6 +276,8 @@ fake_worker() {{ echo "$*" >> "{directory}/events"; }}
                 self.assertEqual({call.split("--worker-index ")[1] for call in calls},
                                  {str(index) for index in range(count)})
                 self.assertTrue(all(f"--worker-count {count}" in call for call in calls))
+                self.assertTrue(all("--scheduled --worker-count" in call for call in calls))
+                self.assertNotIn("日志维护失败", (Path(directory) / "logs/crawl.log").read_text())
                 self.assertFalse(marker.exists())
 
     def test_launcher_rejects_invalid_dotenv_worker_count_before_launch(self):
@@ -260,8 +299,17 @@ fake_worker() {{ echo "$*" >> "{directory}/events"; }}
         # Exercise the actual launcher, replacing only server paths and external
         # executables. The fake workers overlap and the second finishes last.
         launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()
-        for first_exit in (0, 7):
-            with self.subTest(first_exit=first_exit), tempfile.TemporaryDirectory() as directory:
+        for first_exit, cleanup_exit in ((0, 0), (7, 0), (0, 9), (7, 9)):
+            with self.subTest(first_exit=first_exit, cleanup_exit=cleanup_exit), tempfile.TemporaryDirectory() as directory:
+                self.install_cleanup_runtime(directory)
+                (Path(directory) / "tools/cleanup_logs.py").write_text(f'''
+from pathlib import Path
+
+def cleanup(directory, max_bytes, keep, days, dry_run):
+    with Path("events").open("a") as events:
+        events.write("cleanup\\n")
+    raise SystemExit({cleanup_exit})
+''')
                 script = launcher.replace("/www/wwwroot/game_crawl", directory)
                 script = script.replace("/usr/bin/xvfb-run", "fake_worker")
                 script = script.replace("/usr/bin/flock", "fake_flock")
@@ -287,10 +335,14 @@ fake_worker() {{
                 self.assertEqual(result.returncode, first_exit, result.stderr)
                 events = (Path(directory) / "events").read_text().splitlines()
                 self.assertEqual(set(events[:2]), {"start 0 display=90", "start 1 display=91"})
-                self.assertEqual(events[2:], ["done 0", "done 1"])
+                self.assertEqual(events[2:], ["done 0", "done 1", "cleanup"])
                 log = (Path(directory) / "logs/crawl.log").read_text()
                 self.assertIn("worker=1 完成，退出码: 0", log)
-                self.assertIn("本轮耗时:", log)
+                self.assertIn("调度窗口耗时:", log)
+                if cleanup_exit:
+                    self.assertIn(f"日志维护失败，退出码: {cleanup_exit}", log)
+                else:
+                    self.assertNotIn("日志维护失败", log)
 
 
 if __name__ == "__main__":

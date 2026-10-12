@@ -36,6 +36,7 @@ class ExcludedStoreTests(unittest.IsolatedAsyncioTestCase):
                 browser, context, playwright = MagicMock(), MagicMock(), MagicMock()
                 browser.new_context = AsyncMock(return_value=context)
                 browser.close = AsyncMock()
+                context.close = AsyncMock()
                 context.add_cookies = AsyncMock()
                 context.add_init_script = AsyncMock()
                 context.new_page = AsyncMock(return_value=page)

@@ -1,8 +1,8 @@
 """
 从数据库 crawl_target 表读取 URL 列表，批量爬取并保存到 crawl_data 表
 用法: python -m tools.crawl_from_db
-双进程: bash run_crawl_and_consume.sh（生产环境）
-单个分片: python -m tools.crawl_from_db --worker-count 2 --worker-index 0
+生产独立调度: bash run_crawl_and_consume.sh（进程数读取 CRAWL_WORKER_COUNT）
+单轮分片: python -m tools.crawl_from_db --worker-count 2 --worker-index 0
 """
 
 import argparse
@@ -13,8 +13,8 @@ import re
 import time
 from contextlib import AsyncExitStack, contextmanager
 from datetime import datetime
-from time import perf_counter
-from playwright.async_api import async_playwright
+from time import monotonic, perf_counter
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from g2g import config, db
 from g2g.crawl_filter import compile_policies, identifiers, number, select_top3
 
@@ -115,6 +115,48 @@ def timed_stage(label):
         print(f"  -> 阶段完成: {label}，耗时: {perf_counter() - started:.2f} 秒", flush=True)
 
 
+G2G_CARD_COUNT_JS = "() => document.querySelectorAll('[aria-label=\"Product Card\"]').length"
+G2G_CARD_READINESS_JS = r"""
+    limit => {
+        const cards = Array.from(document.querySelectorAll('[aria-label="Product Card"]')).slice(0, limit);
+        let ready = 0;
+        for (const card of cards) {
+            const sellerName = card.querySelector('.truncate.text-xs.font-medium');
+            const sellerLink = card.querySelector('a[href*="g2g.com/"]:not([href*="offer"]):not([href*="categories"])');
+            const sellerId = sellerLink && /g2g\.com\/[A-Za-z0-9_-]+$/.test(sellerLink.getAttribute('href') || '');
+            const price = card.querySelector('.text-base.font-bold');
+            const hasSeller = sellerId || (sellerName && sellerName.innerText.trim());
+            if (hasSeller && price && /\d/.test(price.innerText)) ready++;
+        }
+        return {count: cards.length, ready};
+    }
+"""
+
+
+async def wait_for_g2g_card_fields(page, offer_limit, timeout_ms=3000):
+    """卡片价格和卖家身份齐全即可读取；超时保留原有缺字段提取行为。"""
+    state = await page.evaluate(G2G_CARD_READINESS_JS, offer_limit)
+    if state["count"] == state["ready"]:
+        return state
+    try:
+        handle = await page.wait_for_function(
+            "limit => { const state = (" + G2G_CARD_READINESS_JS + ")(limit); "
+            "return state.count > 0 && state.count === state.ready ? state : false; }",
+            arg=offer_limit, polling=100, timeout=timeout_ms,
+        )
+        try:
+            return await handle.json_value()
+        finally:
+            await handle.dispose()
+    except PlaywrightTimeoutError:
+        state = await page.evaluate(G2G_CARD_READINESS_JS, offer_limit)
+        print(
+            f"  [!] G2G 卡片字段等待达到 {timeout_ms / 1000:g} 秒，"
+            f"就绪 {state['ready']}/{state['count']}，继续按现有规则提取"
+        )
+        return state
+
+
 async def scrape_page(page, url: str) -> list:
     """爬取单个页面的产品卡片"""
     offer_limit = config.CRAWL_OFFER_LIMIT
@@ -142,25 +184,31 @@ async def scrape_page(page, url: str) -> list:
     # 等待卡片加载
     with timed_stage("G2G 首批卡片加载"):
         for i in range(60):
-            cards = await page.query_selector_all('[aria-label="Product Card"]')
-            if len(cards) > 0:
+            count = await page.evaluate(G2G_CARD_COUNT_JS)
+            if count > 0:
                 break
             await asyncio.sleep(1)
-    with timed_stage("G2G 卡片稳定等待（固定 3 秒）"):
-        await asyncio.sleep(3)
 
     # 滚动加载
     with timed_stage("G2G 列表数量检查与滚动加载"):
         prev_count = 0
+        scroll_count = 0
         for s in range(10):
-            count = len(await page.query_selector_all('[aria-label="Product Card"]'))
+            count = await page.evaluate(G2G_CARD_COUNT_JS)
             if count >= offer_limit:
                 break
             if count == prev_count:
                 break
             prev_count = count
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            scroll_count += 1
             await asyncio.sleep(2)
+        print(f"  -> G2G 列表检查: 卡片 {count}，上限 {offer_limit}，滚动 {scroll_count} 次")
+
+    # 数量确定后检查最终候选，包含滚动中新加载的卡片。
+    with timed_stage("G2G 卡片字段就绪等待（最多 3 秒）"):
+        state = await wait_for_g2g_card_fields(page, offer_limit)
+        print(f"  -> G2G 卡片字段: 就绪 {state['ready']}/{state['count']}")
 
     # ========== 先提取页面级别货币（全局指示器） ==========
     with timed_stage("G2G 页面货币解析"):
@@ -1110,7 +1158,9 @@ class CrawlSession:
         self.resources = AsyncExitStack()
         self.playwright = None
         self.browser = None
+        self.g2g_context = None
         self.page = None
+        self.browser_cleanup_pending = False
         self.eldorado_request = None
 
     async def __aenter__(self):
@@ -1118,7 +1168,42 @@ class CrawlSession:
         return self
 
     async def __aexit__(self, *args):
-        return await self.resources.__aexit__(*args)
+        try:
+            await self._close_browser()
+        finally:
+            # 即使关闭期间被取消，也继续释放 request / Playwright driver。
+            result = await self.resources.__aexit__(*args)
+        return result
+
+    async def _try_close(self, resource, label):
+        try:
+            await asyncio.wait_for(resource.close(), timeout=3)
+            return True
+        except Exception as error:
+            print(f"  [!] {label}关闭失败: {type(error).__name__}: {error}", flush=True)
+            return False
+
+    async def _close_g2g_context(self):
+        context, self.g2g_context = self.g2g_context, None
+        self.page = None
+        if context is None:
+            return True
+        return await self._try_close(context, "G2G 上下文")
+
+    async def _close_browser(self):
+        await self._close_g2g_context()
+        if self.browser is None:
+            self.browser_cleanup_pending = False
+            return True
+        browser = self.browser
+        closed = await self._try_close(browser, "Chromium")
+        if closed or browser.is_connected() is False:
+            self.browser = None
+            self.browser_cleanup_pending = False
+            return True
+        # 保留唯一的待回收 browser，下次清理成功前不再叠加新浏览器。
+        self.browser_cleanup_pending = True
+        return False
 
     async def get_playwright(self):
         if self.playwright is None:
@@ -1127,34 +1212,56 @@ class CrawlSession:
         return self.playwright
 
     async def get_browser(self, reason):
+        if self.browser is not None and (
+            self.browser_cleanup_pending or self.browser.is_connected() is False
+        ):
+            if not await self._close_browser():
+                raise RuntimeError("旧 Chromium 尚未回收，暂不创建新浏览器")
         if self.browser is None:
             playwright = await self.get_playwright()
             print(f"  -> 按需启动 Chromium（{reason}）")
             with timed_stage("Chromium 启动"):
                 self.browser = await playwright.chromium.launch(**config.browser_launch_kwargs())
-            self.resources.push_async_callback(self.browser.close)
         return self.browser
 
     async def get_g2g_page(self):
+        browser = await self.get_browser("G2G 页面抓取")
         if self.page is None:
-            browser = await self.get_browser("G2G 页面抓取")
             with timed_stage("G2G 上下文与页面初始化"):
                 context = await browser.new_context(
                     viewport=config.VIEWPORT,
                     user_agent=config.USER_AGENT,
                 )
-                await context.add_cookies([{
-                    "name": "g2g_regional",
-                    "value": '{"country":"US","language":"en","currency":"USD"}',
-                    "domain": ".g2g.com",
-                    "path": "/",
-                }])
-                await context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    window.chrome = { runtime: {} };
-                """)
-                self.page = await context.new_page()
+                self.g2g_context = context
+                try:
+                    await context.add_cookies([{
+                        "name": "g2g_regional",
+                        "value": '{"country":"US","language":"en","currency":"USD"}',
+                        "domain": ".g2g.com",
+                        "path": "/",
+                    }])
+                    await context.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        window.chrome = { runtime: {} };
+                    """)
+                    self.page = await context.new_page()
+                except BaseException:
+                    if not await self._close_g2g_context():
+                        await self._close_browser()
+                    raise
         return self.page
+
+    async def park_g2g_page(self):
+        if self.page is None:
+            return
+        try:
+            with timed_stage("G2G 页面暂停"):
+                await asyncio.wait_for(
+                    self.page.goto("about:blank", wait_until="commit", timeout=3000), timeout=4)
+        except Exception as error:
+            print(f"  [!] G2G 页面暂停失败，关闭上下文后下次重建: {error}", flush=True)
+            if not await self._close_g2g_context():
+                await self._close_browser()
 
     async def scrape_eldorado(self, url):
         if self.eldorado_request is None:
@@ -1198,19 +1305,7 @@ class CrawlSession:
             await context.close()
 
 
-async def run(worker_index: int = 0, worker_count: int = 1):
-    run_started = perf_counter()
-    # 读取目标
-    targets = db.get_pending_targets(worker_index, worker_count)
-    print(
-        f"[*] crawl_server={config.CRAWL_SERVER}, worker {worker_index + 1}/{worker_count}: "
-        f"从数据库读取到 {len(targets)} 个爬取目标"
-    )
-
-    if not targets:
-        print("[*] 当前分片没有爬取目标")
-        return 0
-
+def valid_crawl_targets(targets):
     valid_targets = []
     for idx, target in enumerate(targets):
         try:
@@ -1233,78 +1328,101 @@ async def run(worker_index: int = 0, worker_count: int = 1):
 
         valid_targets.append((idx, target))
 
-    async with CrawlSession() as session:
-        total_saved = 0
-        failed_count = 0
-        async for idx, target in iter_scheduled_targets(valid_targets, len(targets)):
-            target_id = target.get("id")
-            game_product_id = int(target.get("game_product_id"))
-            url = target.get("url")
-            name = target.get("name", "")
-            category = str(target.get("category") or "").strip()
+    return valid_targets
 
-            platform = "eldorado" if "eldorado.gg" in url else "g2g"
-            category_label = category or "未设置类别"
-            print(
-                f"\n[{idx+1}/{len(targets)}] {name} "
-                f"(target_id={target_id}, game_product_id={game_product_id}, "
-                f"category={category_label})"
-            )
 
-            target_started = perf_counter()
-            try:
-                # 1 优先按绑定店铺加强，空名单按策略 Top3 加强；均保存全部候选。
-                crawl_type = target.get("crawl_type") or 0
-                enhance_enabled = crawl_type in (1, "1", "top3")
-                if not enhance_enabled and crawl_type not in (0, "0", "default"):
-                    raise ValueError(f"未知爬虫类型: {crawl_type}")
-                enhance_stores = target.get("enhance_stores") or ""
-                enhance_policies = None
-                if enhance_enabled and category in {"金币", "游戏币"} and not identifiers(enhance_stores):
-                    enhance_policies = compile_policies(db.get_crawl_strategies(target_id))
+async def crawl_target(session, idx, target, total):
+    target_id = target.get("id")
+    game_product_id = int(target.get("game_product_id"))
+    url = target.get("url")
+    name = target.get("name", "")
+    category = str(target.get("category") or "").strip()
 
-                # 爬取前先将版本号 +1，本批数据全部使用新版本号写入。
-                # PHP 侧通过 crawl_target.version 对应 crawl_data.version 做改价策略。
-                crawl_started_at = datetime.fromtimestamp(time.time()).replace(microsecond=0)
-                version = db.increment_version(target_id)
-                print(f"  -> version={version}, 开始时间={crawl_started_at}")
+    platform = "eldorado" if "eldorado.gg" in url else "g2g"
+    category_label = category or "未设置类别"
+    print(
+        f"\n[{idx+1}/{total}] {name} "
+        f"(target_id={target_id}, game_product_id={game_product_id}, "
+        f"category={category_label})"
+    )
 
-                # 按 category 分流到不同爬取函数
-                if category == "ELD游戏币":
-                    items = await session.scrape_eldorado(url)
-                elif category in {"金币", "游戏币"}:
-                    page = await session.get_g2g_page()
-                    if enhance_enabled:
-                        items = await scrape_other_offer_page(
-                            page, url, refresh_unit_prices=True,
-                            enhance_stores=enhance_stores, policies=enhance_policies,
-                        )
-                    else:
-                        items = await scrape_other_offer_page(page, url)
-                else:
-                    page = await session.get_g2g_page()
-                    items = await scrape_page(page, url)
-                print(f"  -> 提取 {len(items)} 条")
+    target_started = perf_counter()
+    inserted = 0
+    try:
+        # 1 优先按绑定店铺加强，空名单按策略 Top3 加强；均保存全部候选。
+        crawl_type = target.get("crawl_type") or 0
+        enhance_enabled = crawl_type in (1, "1", "top3")
+        if not enhance_enabled and crawl_type not in (0, "0", "default"):
+            raise ValueError(f"未知爬虫类型: {crawl_type}")
+        enhance_stores = target.get("enhance_stores") or ""
+        enhance_policies = None
+        if enhance_enabled and category in {"金币", "游戏币"} and not identifiers(enhance_stores):
+            enhance_policies = compile_policies(db.get_crawl_strategies(target_id))
 
-                inserted = db.save_crawl_data(
-                    target_id,
-                    platform,
-                    items,
-                    game_product_id=game_product_id,
-                    version=version,
+        # 爬取前先将版本号 +1，本批数据全部使用新版本号写入。
+        # PHP 侧通过 crawl_target.version 对应 crawl_data.version 做改价策略。
+        started_wall, started_mono = time.time(), monotonic()
+        crawl_started_at = datetime.fromtimestamp(started_wall).replace(microsecond=0)
+        version = db.increment_version(target_id)
+        print(f"  -> version={version}, 开始时间={crawl_started_at}")
+
+        # 按 category 分流到不同爬取函数
+        if category == "ELD游戏币":
+            items = await session.scrape_eldorado(url)
+        elif category in {"金币", "游戏币"}:
+            page = await session.get_g2g_page()
+            if enhance_enabled:
+                items = await scrape_other_offer_page(
+                    page, url, refresh_unit_prices=True,
+                    enhance_stores=enhance_stores, policies=enhance_policies,
                 )
-                total_saved += inserted
-                print(f"  -> 新增 {inserted} 条")
+            else:
+                items = await scrape_other_offer_page(page, url)
+        else:
+            page = await session.get_g2g_page()
+            items = await scrape_page(page, url)
+        print(f"  -> 提取 {len(items)} 条")
 
-                db.update_last_crawl(target_id, crawl_started_at)
-                # 发信号通知 PHP：该目标已爬完，由 PHP 消费通知后执行改价策略
-                db.insert_crawl_notify(target_id, version, inserted)
-                print(f"  -> 已写入爬取完成通知(crawl_notify)")
-                print(f"  -> 目标完成，耗时: {perf_counter() - target_started:.2f} 秒")
-            except Exception as e:
-                failed_count += 1
-                print(f"  -> 错误: {e}（目标耗时: {perf_counter() - target_started:.2f} 秒）")
+        inserted = db.save_crawl_data(
+            target_id,
+            platform,
+            items,
+            game_product_id=game_product_id,
+            version=version,
+        )
+        print(f"  -> 新增 {inserted} 条")
 
+        db.update_last_crawl(target_id, crawl_started_at)
+        # 发信号通知 PHP：该目标已爬完，由 PHP 消费通知后执行改价策略
+        db.insert_crawl_notify(target_id, version, inserted)
+        print(f"  -> 已写入爬取完成通知(crawl_notify)")
+        print(f"  -> 目标完成，耗时: {perf_counter() - target_started:.2f} 秒")
+        return inserted, False, started_wall, started_mono
+    except Exception as e:
+        print(f"  -> 错误: {e}（目标耗时: {perf_counter() - target_started:.2f} 秒）")
+        return inserted, True, None, None
+    finally:
+        if category != "ELD游戏币":
+            await session.park_g2g_page()
+
+
+async def run(worker_index: int = 0, worker_count: int = 1):
+    """兼容一次性执行；生产脚本使用 run_scheduled。"""
+    run_started = perf_counter()
+    targets = db.get_pending_targets(worker_index, worker_count)
+    print(
+        f"[*] crawl_server={config.CRAWL_SERVER}, worker {worker_index + 1}/{worker_count}: "
+        f"从数据库读取到 {len(targets)} 个爬取目标"
+    )
+    if not targets:
+        print("[*] 当前分片没有爬取目标")
+        return 0
+    total_saved = failed_count = 0
+    async with CrawlSession() as session:
+        async for idx, target in iter_scheduled_targets(valid_crawl_targets(targets), len(targets)):
+            saved, failed, _, _ = await crawl_target(session, idx, target, len(targets))
+            total_saved += saved
+            failed_count += failed
     print(
         f"\n[*] 分片完成! 共保存 {total_saved} 条数据，失败 {failed_count} 个目标，"
         f"worker 耗时: {perf_counter() - run_started:.2f} 秒"
@@ -1312,10 +1430,129 @@ async def run(worker_index: int = 0, worker_count: int = 1):
     return 1 if failed_count else 0
 
 
+class RepeatingSchedule:
+    """最早到期优先；仅供一个串行 worker 使用，互斥仍由启动脚本负责。"""
+
+    def __init__(self, worker_index, worker_count, run_seconds):
+        self.worker_index = worker_index
+        self.worker_count = worker_count
+        self.ends_at = monotonic() + run_seconds
+        self.refresh_at = float("-inf")
+        self.states = {}
+        self.total = 0
+        self.metadata_valid = False
+        self.refresh_failures = 0
+
+    def refresh(self):
+        # 每次读取使用短连接；next_target 在查询失败期间暂停使用旧快照。
+        targets = db.get_pending_targets(self.worker_index, self.worker_count)
+        now, wall_now = monotonic(), time.time()
+        previous_ids = set(self.states)
+        states = {}
+        for idx, target in valid_crawl_targets(targets):
+            target_id = target["id"]
+            state = self.states.get(target_id, {"first_due": now, "retry_at": 0})
+            # 无间隔的任务沿用 cron 的基础 30 秒周期，避免驻留模式忙循环。
+            effective = dict(target)
+            try:
+                interval = max(0, int(target.get("crawl_interval") or 0)) or 30
+            except (TypeError, ValueError, OverflowError):
+                interval = 30
+            effective["crawl_interval"] = interval
+            deadline, _ = crawl_interval_deadline(effective, f"target_id={target_id}")
+            due = now + deadline - wall_now if deadline else state["first_due"]
+            if "success_mono" in state:
+                local_due = state["success_mono"] + interval
+                # 自己已写入的时间（或更旧快照）使用单调时钟，墙钟回拨也不延迟。
+                # 外部更晚的成功记录仍生效，但不能缩短本地实际开始间隔。
+                if not deadline or deadline - interval <= math.floor(state["success_wall"]):
+                    due = local_due
+                else:
+                    due = max(due, local_due)
+            state.update(target=target, idx=idx, interval=interval,
+                         due=max(due, state["retry_at"]))
+            states[target_id] = state
+        self.states, self.total = states, len(targets)
+        self.refresh_at = now + 5
+        self.metadata_valid = True
+        if previous_ids != set(states):
+            print(f"[*] worker {self.worker_index + 1}/{self.worker_count} "
+                  f"刷新任务: {len(states)} 个有效目标", flush=True)
+
+    async def next_target(self):
+        while monotonic() < self.ends_at:
+            if monotonic() >= self.refresh_at:
+                try:
+                    self.refresh()
+                except Exception as error:
+                    self.metadata_valid = False
+                    self.refresh_failures += 1
+                    self.refresh_at = monotonic() + 30
+                    print(f"  [!] 任务刷新失败，暂停抓取，30 秒后重试: {error}", flush=True)
+            now = monotonic()
+            if now >= self.ends_at:
+                return None
+            state = min(self.states.values() if self.metadata_valid else (),
+                        key=lambda s: (s["due"], s["target"]["id"]),
+                        default=None)
+            if state is not None and state["due"] <= now:
+                return state
+            # 每次最多等到下次元数据刷新，新增/停用/调整间隔能被重新读取。
+            wake_at = min(self.ends_at, self.refresh_at,
+                          state["due"] if state is not None else self.ends_at)
+            await asyncio.sleep(max(0, wake_at - now))
+        return None
+
+    def completed(self, state, failed, started_wall, started_mono):
+        if failed:
+            # 不更新数据库 last_crawl_at；退避仅在本窗口内有效。
+            state["retry_at"] = monotonic() + 30
+            state["due"] = state["retry_at"]
+            print(f"  -> target_id={state['target']['id']} 失败退避 30 秒", flush=True)
+        else:
+            state["success_mono"] = started_mono
+            state["success_wall"] = started_wall
+            state["retry_at"] = 0
+            state["due"] = started_mono + state["interval"]
+        remaining = max(0, state["due"] - monotonic())
+        print(f"  -> target_id={state['target']['id']} 下次最早约 {remaining:.1f} 秒后执行", flush=True)
+
+
+async def run_scheduled(worker_index=0, worker_count=1, run_seconds=None):
+    """有界驻留：窗口内各分片独立调度，结束后释放所有资源供下次启动。"""
+    if run_seconds is None:
+        run_seconds = config.CRAWL_WORKER_RUN_SECONDS
+    if run_seconds < 0:
+        raise ValueError("run_seconds 不能小于 0")
+    if run_seconds == 0:
+        return await run(worker_index, worker_count)
+    started = perf_counter()
+    schedule = RepeatingSchedule(worker_index, worker_count, run_seconds)
+    total_saved = failed_count = attempted = 0
+    print(f"[*] crawl_server={config.CRAWL_SERVER}, worker {worker_index + 1}/{worker_count}: "
+          f"独立调度窗口 {run_seconds} 秒，默认周期 30 秒，任务刷新 5 秒", flush=True)
+    async with CrawlSession() as session:
+        while True:
+            state = await schedule.next_target()
+            if state is None:
+                break
+            saved, failed, started_wall, started_mono = await crawl_target(
+                session, state["idx"], state["target"], schedule.total)
+            attempted += 1
+            total_saved += saved
+            failed_count += failed
+            schedule.completed(state, failed, started_wall, started_mono)
+    print(f"[*] 调度窗口结束: 执行 {attempted} 次，保存 {total_saved} 条，"
+          f"目标失败 {failed_count} 次，任务刷新失败 {schedule.refresh_failures} 次，"
+          f"worker 耗时: {perf_counter() - started:.2f} 秒", flush=True)
+    return 1 if failed_count or schedule.refresh_failures else 0
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="从数据库分片爬取目标")
     parser.add_argument("--worker-count", type=int, default=1, help="总进程数，默认 1")
     parser.add_argument("--worker-index", type=int, default=0, help="当前进程编号，从 0 开始")
+    parser.add_argument("--scheduled", action="store_true", help="窗口内独立按到期时间调度并复用浏览器")
     args = parser.parse_args(argv)
     if args.worker_count < 1:
         parser.error("--worker-count 必须大于 0")
@@ -1326,4 +1563,5 @@ def parse_args(argv=None):
 
 if __name__ == "__main__":
     args = parse_args()
-    raise SystemExit(asyncio.run(run(args.worker_index, args.worker_count)))
+    entrypoint = run_scheduled if args.scheduled else run
+    raise SystemExit(asyncio.run(entrypoint(args.worker_index, args.worker_count)))

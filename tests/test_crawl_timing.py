@@ -12,16 +12,11 @@ class CrawlTimingTests(unittest.IsolatedAsyncioTestCase):
     async def test_g2g_navigation_card_wait_and_extraction_have_separate_timings(self):
         now = 0.0
         page = MagicMock()
-        card_results = iter(([], [object()] * 10, [object()] * 10))
+        card_counts = iter((0, 10, 10))
 
         async def navigate(*args, **kwargs):
             nonlocal now
             now += 4
-
-        async def cards(*args):
-            nonlocal now
-            now += .2
-            return next(card_results)
 
         async def sleep(seconds):
             nonlocal now
@@ -29,6 +24,12 @@ class CrawlTimingTests(unittest.IsolatedAsyncioTestCase):
 
         async def evaluate(script, *args):
             nonlocal now
+            if script == crawl_from_db.G2G_CARD_COUNT_JS:
+                now += .2
+                return next(card_counts)
+            if script == crawl_from_db.G2G_CARD_READINESS_JS:
+                now += .1
+                return {"count": 10, "ready": 10}
             if "document.cookie.match" in script:
                 now += .1
                 return "USD"
@@ -42,7 +43,8 @@ class CrawlTimingTests(unittest.IsolatedAsyncioTestCase):
             self.fail("Unexpected page operation")
 
         page.goto = AsyncMock(side_effect=navigate)
-        page.query_selector_all = AsyncMock(side_effect=cards)
+        page.query_selector_all = AsyncMock()
+        page.wait_for_function = AsyncMock()
         page.evaluate = AsyncMock(side_effect=evaluate)
         output = io.StringIO()
         with patch.object(crawl_from_db, "perf_counter", side_effect=lambda: now), \
@@ -56,15 +58,18 @@ class CrawlTimingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["currency"], "USD")
         self.assertEqual(rows[0]["rating"], "96.00")
         page.goto.assert_awaited_once_with("https://fixture.test/", wait_until="domcontentloaded", timeout=60000)
-        self.assertEqual([call.args[0] for call in mocked_sleep.await_args_list], [1, 3])
+        self.assertEqual([call.args[0] for call in mocked_sleep.await_args_list], [1])
+        page.query_selector_all.assert_not_awaited()
+        page.wait_for_function.assert_not_awaited()
         for label, seconds in (("G2G 页面导航", "4.00"), ("G2G 货币检查", "0.10"),
                                ("G2G 首批卡片加载", "1.40"),
-                               ("G2G 卡片稳定等待（固定 3 秒）", "3.00"),
+                               ("G2G 卡片字段就绪等待（最多 3 秒）", "0.10"),
                                ("G2G 列表数量检查与滚动加载", "0.20"),
                                ("G2G 页面货币解析", "0.20"), ("G2G 卡片数据提取", "0.40"),
                                ("G2G 数据过滤与价格解析", "0.00")):
             self.assertIn(f"阶段开始: {label}", output.getvalue())
             self.assertIn(f"阶段完成: {label}，耗时: {seconds} 秒", output.getvalue())
+        self.assertIn("卡片 10，上限 10，滚动 0 次", output.getvalue())
 
     async def test_navigation_failure_identifies_stage_and_preserves_original_error(self):
         page = MagicMock()

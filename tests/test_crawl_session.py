@@ -24,19 +24,33 @@ def records():
              "user": {"username": f"seller{i}"}} for i in range(8)]
 
 
+def browser_context():
+    page = MagicMock()
+    page.goto = AsyncMock()
+    page.close = AsyncMock()
+    context = MagicMock()
+    context.add_cookies = AsyncMock()
+    context.add_init_script = AsyncMock()
+    context.new_page = AsyncMock(return_value=page)
+    context.close = AsyncMock()
+    return context
+
+
+def chromium(context):
+    browser = MagicMock()
+    browser.new_context = AsyncMock(return_value=context)
+    browser.close = AsyncMock()
+    browser.is_connected.return_value = True
+    return browser
+
+
 class CrawlSessionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.request = MagicMock()
         self.request.get = AsyncMock()
         self.request.dispose = AsyncMock()
-        self.context = MagicMock()
-        self.context.add_cookies = AsyncMock()
-        self.context.add_init_script = AsyncMock()
-        self.context.new_page = AsyncMock()
-        self.context.close = AsyncMock()
-        self.browser = MagicMock()
-        self.browser.new_context = AsyncMock(return_value=self.context)
-        self.browser.close = AsyncMock()
+        self.context = browser_context()
+        self.browser = chromium(self.context)
         self.playwright = MagicMock()
         self.playwright.request.new_context = AsyncMock(return_value=self.request)
         self.playwright.chromium.launch = AsyncMock(return_value=self.browser)
@@ -116,6 +130,8 @@ class CrawlSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_mixed_targets_reuse_browser_and_keep_eld_context_isolated(self):
         failed, success = api_response(status=403), api_response(records=records())
         self.request.get.side_effect = [failed, success]
+        eld_context = browser_context()
+        self.browser.new_context.side_effect = [self.context, eld_context]
         with patch.object(crawl_from_db, "async_playwright", return_value=self.manager), \
              patch.object(crawl_from_db, "scrape_eldorado_dom", new=AsyncMock(return_value=[])) as dom, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -127,17 +143,187 @@ class CrawlSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(await session.get_g2g_page(), first_page)
         self.playwright.chromium.launch.assert_awaited_once()
         self.assertEqual(self.browser.new_context.await_count, 2)
-        self.assertEqual(self.context.new_page.await_count, 2)
-        g2g_cookies, eld_cookies = [call.args[0] for call in self.context.add_cookies.await_args_list]
+        self.context.new_page.assert_awaited_once()
+        eld_context.new_page.assert_awaited_once()
+        g2g_cookies = self.context.add_cookies.await_args.args[0]
+        eld_cookies = eld_context.add_cookies.await_args.args[0]
         self.assertEqual(g2g_cookies[0]["domain"], ".g2g.com")
         self.assertEqual({cookie["name"] for cookie in eld_cookies},
                          {"eldoradogg_currencyPreference", "eldoradogg_locale"})
         dom.assert_awaited_once()
         self.context.close.assert_awaited_once()
+        eld_context.close.assert_awaited_once()
         self.browser.close.assert_awaited_once()
         self.request.dispose.assert_awaited_once()
         failed.dispose.assert_awaited_once()
         success.dispose.assert_awaited_once()
+
+    async def test_park_reuses_g2g_page_context_and_browser_until_session_exit(self):
+        with patch.object(crawl_from_db, "async_playwright", return_value=self.manager), \
+             contextlib.redirect_stdout(io.StringIO()):
+            async with crawl_from_db.CrawlSession() as session:
+                page = await session.get_g2g_page()
+                await session.park_g2g_page()
+                self.assertIs(session.g2g_context, self.context)
+                self.assertIs(await session.get_g2g_page(), page)
+                self.context.close.assert_not_awaited()
+                self.browser.close.assert_not_awaited()
+        page.goto.assert_awaited_once_with("about:blank", wait_until="commit", timeout=3000)
+        self.playwright.chromium.launch.assert_awaited_once()
+        self.browser.new_context.assert_awaited_once()
+        self.context.close.assert_awaited_once()
+        self.browser.close.assert_awaited_once()
+
+    async def test_failed_park_closes_context_and_rebuilds_on_same_browser(self):
+        replacement = browser_context()
+        self.browser.new_context.side_effect = [self.context, replacement]
+        self.context.new_page.return_value.goto.side_effect = TimeoutError("park timed out")
+        with patch.object(crawl_from_db, "async_playwright", return_value=self.manager), \
+             contextlib.redirect_stdout(io.StringIO()):
+            async with crawl_from_db.CrawlSession() as session:
+                await session.get_g2g_page()
+                await session.park_g2g_page()
+                self.assertIsNone(session.page)
+                self.assertIsNone(session.g2g_context)
+                self.context.close.assert_awaited_once()
+                self.assertIs(await session.get_g2g_page(), replacement.new_page.return_value)
+        self.playwright.chromium.launch.assert_awaited_once()
+        self.assertEqual(self.browser.new_context.await_count, 2)
+        self.context.close.assert_awaited_once()
+        replacement.close.assert_awaited_once()
+        self.browser.close.assert_awaited_once()
+
+    async def test_failed_context_close_retires_browser_without_disposing_eld_request(self):
+        replacement_context = browser_context()
+        replacement_browser = chromium(replacement_context)
+        self.playwright.chromium.launch.side_effect = [self.browser, replacement_browser]
+        self.context.new_page.return_value.goto.side_effect = TimeoutError("park timed out")
+        self.context.close.side_effect = RuntimeError("context close failed")
+        self.request.get.return_value = api_response(records=records())
+        with patch.object(crawl_from_db, "async_playwright", return_value=self.manager), \
+             contextlib.redirect_stdout(io.StringIO()):
+            async with crawl_from_db.CrawlSession() as session:
+                await session.scrape_eldorado("https://www.eldorado.gg/currency/g/24")
+                await session.get_g2g_page()
+                await session.park_g2g_page()
+                self.browser.close.assert_awaited_once()
+                self.assertIsNone(session.browser)
+                self.assertIs(session.eldorado_request, self.request)
+                self.request.dispose.assert_not_awaited()
+                self.assertIs(await session.get_g2g_page(), replacement_context.new_page.return_value)
+        self.assertEqual(self.playwright.chromium.launch.await_count, 2)
+        self.context.close.assert_awaited_once()
+        replacement_context.close.assert_awaited_once()
+        replacement_browser.close.assert_awaited_once()
+        self.request.dispose.assert_awaited_once()
+
+    async def test_disconnected_browser_rebuilds_instead_of_returning_stale_page(self):
+        replacement_context = browser_context()
+        replacement_browser = chromium(replacement_context)
+        self.playwright.chromium.launch.side_effect = [self.browser, replacement_browser]
+        with patch.object(crawl_from_db, "async_playwright", return_value=self.manager), \
+             contextlib.redirect_stdout(io.StringIO()):
+            async with crawl_from_db.CrawlSession() as session:
+                old_page = await session.get_g2g_page()
+                self.browser.is_connected.return_value = False
+                new_page = await session.get_g2g_page()
+                self.assertIsNot(new_page, old_page)
+                self.assertIs(new_page, replacement_context.new_page.return_value)
+        self.context.close.assert_awaited_once()
+        self.browser.close.assert_awaited_once()
+        replacement_context.close.assert_awaited_once()
+        replacement_browser.close.assert_awaited_once()
+        self.manager.__aenter__.assert_awaited_once()
+
+    async def test_partial_g2g_initialization_failure_releases_context_and_preserves_error(self):
+        for phase in ("add_cookies", "add_init_script", "new_page"):
+            with self.subTest(phase=phase):
+                self.setUp()
+                replacement = browser_context()
+                self.browser.new_context.side_effect = [self.context, replacement]
+                error = RuntimeError(f"{phase} failed")
+                getattr(self.context, phase).side_effect = error
+                with patch.object(crawl_from_db, "async_playwright", return_value=self.manager), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    async with crawl_from_db.CrawlSession() as session:
+                        with self.assertRaises(RuntimeError) as caught:
+                            await session.get_g2g_page()
+                        self.assertIs(caught.exception, error)
+                        self.assertIsNone(session.page)
+                        self.assertIsNone(session.g2g_context)
+                        self.context.close.assert_awaited_once()
+                        self.assertIs(await session.get_g2g_page(), replacement.new_page.return_value)
+                self.context.close.assert_awaited_once()
+                replacement.close.assert_awaited_once()
+                self.browser.close.assert_awaited_once()
+                self.playwright.chromium.launch.assert_awaited_once()
+
+    async def test_cleanup_failure_keeps_completed_result_and_prevents_duplicate_browser(self):
+        target = {"id": 18, "game_product_id": 20, "category": "物品",
+                  "url": "https://www.g2g.com/fixture"}
+        self.context.new_page.return_value.goto.side_effect = TimeoutError("park timed out")
+        self.context.close.side_effect = RuntimeError("context stuck")
+        self.browser.close.side_effect = RuntimeError("browser stuck")
+        with patch.object(crawl_from_db, "async_playwright", return_value=self.manager), \
+             patch.object(crawl_from_db, "scrape_page", new=AsyncMock(return_value=[{"price": "1"}])), \
+             patch.object(db, "increment_version", return_value=9), \
+             patch.object(db, "save_crawl_data", return_value=1) as save, \
+             patch.object(db, "update_last_crawl"), \
+             patch.object(db, "insert_crawl_notify") as notify, \
+             contextlib.redirect_stdout(io.StringIO()):
+            async with crawl_from_db.CrawlSession() as session:
+                result = await crawl_from_db.crawl_target(session, 0, target, 1)
+                self.assertEqual(result[:2], (1, False))
+                self.assertIsNone(session.page)
+                self.assertIsNone(session.g2g_context)
+                self.assertTrue(session.browser_cleanup_pending)
+                with self.assertRaisesRegex(RuntimeError, "旧 Chromium 尚未回收"):
+                    await session.get_g2g_page()
+                self.playwright.chromium.launch.assert_awaited_once()
+                self.browser.close.side_effect = None
+        save.assert_called_once()
+        notify.assert_called_once_with(18, 9, 1)
+        self.context.close.assert_awaited_once()
+        self.manager.__aexit__.assert_awaited_once()
+
+    async def test_hung_context_close_is_cancelled_then_browser_is_closed(self):
+        cancelled = []
+        original_wait_for = asyncio.wait_for
+
+        async def hung_close():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(True)
+
+        async def quick_timeout(awaitable, timeout):
+            return await original_wait_for(awaitable, min(timeout, 0.01))
+
+        self.context.close.side_effect = hung_close
+        self.context.new_page.return_value.goto.side_effect = TimeoutError("park timed out")
+        with patch.object(crawl_from_db, "async_playwright", return_value=self.manager), \
+             patch.object(crawl_from_db.asyncio, "wait_for", side_effect=quick_timeout) as wait, \
+             contextlib.redirect_stdout(io.StringIO()):
+            async with crawl_from_db.CrawlSession() as session:
+                await session.get_g2g_page()
+                await session.park_g2g_page()
+                self.assertIsNone(session.browser)
+        self.assertEqual(cancelled, [True])
+        self.browser.close.assert_awaited_once()
+        self.assertIn(3, [call.kwargs["timeout"] for call in wait.await_args_list])
+
+    async def test_cancelled_browser_cleanup_still_disposes_request_and_driver(self):
+        with patch.object(crawl_from_db, "async_playwright", return_value=self.manager), \
+             patch.object(crawl_from_db, "scrape_eldorado_api", new=AsyncMock(return_value=[])), \
+             contextlib.redirect_stdout(io.StringIO()):
+            session = crawl_from_db.CrawlSession()
+            await session.__aenter__()
+            await session.scrape_eldorado("https://www.eldorado.gg/currency/g/24")
+            with patch.object(session, "_close_browser", new=AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    await session.__aexit__(None, None, None)
+        self.request.dispose.assert_awaited_once()
+        self.manager.__aexit__.assert_awaited_once()
 
     async def test_api_failure_conditions_fall_back_once_and_release_response(self):
         for failure in ("http", "json", "empty", "network", "url"):

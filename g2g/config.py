@@ -61,6 +61,11 @@ if ELD_OFFER_PAGE_SIZE < 1:
 # 全局排除店铺：在加强选择、价格处理和入库前跳过，支持逗号分隔多个名字。
 CRAWL_EXCLUDE_STORES = os.environ.get("CRAWL_EXCLUDE_STORES", "")
 
+# 生产调度软窗口：窗口结束不再领取新任务，完成当前目标后退出；0 回退单轮。
+CRAWL_WORKER_RUN_SECONDS = int(os.environ.get("CRAWL_WORKER_RUN_SECONDS", "300"))
+if CRAWL_WORKER_RUN_SECONDS < 0:
+    raise ValueError("CRAWL_WORKER_RUN_SECONDS 必须为非负整数")
+
 # 浏览器
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
