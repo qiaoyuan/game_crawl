@@ -11,6 +11,7 @@ import json
 import math
 import re
 import time
+from contextlib import AsyncExitStack
 from datetime import datetime
 from time import perf_counter
 from playwright.async_api import async_playwright
@@ -598,8 +599,8 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enh
     return items
 
 
-async def scrape_eldorado_page(page, url: str) -> list:
-    """爬取 Eldorado 游戏币页面，优先直连官方 offers API，DOM 作为兜底。"""
+async def scrape_eldorado_api(request, url: str) -> list | None:
+    """直接请求 offers API；None 表示需要 DOM 兜底，空列表是有效结果。"""
     from urllib.parse import parse_qs, quote, urlencode, urlparse
 
     offer_limit = config.ELD_OFFER_PAGE_SIZE
@@ -642,7 +643,7 @@ async def scrape_eldorado_page(page, url: str) -> list:
             + urlencode(params)
         )
         try:
-            api_response = await page.request.get(
+            api_response = await request.get(
                 api_url,
                 headers={
                     "Accept": "application/json",
@@ -803,6 +804,24 @@ async def scrape_eldorado_page(page, url: str) -> list:
                 return api_items
     except Exception as e:
         print(f"  [!] Eldorado API 数据解析失败，回退 DOM 解析: {e}")
+    finally:
+        if api_response is not None:
+            await api_response.dispose()
+
+    return None
+
+
+async def scrape_eldorado_page(page, url: str) -> list:
+    """兼容已有页面调用，生产入口可直接请求 API 而不创建页面。"""
+    items = await scrape_eldorado_api(page.request, url)
+    if items is not None:
+        return items
+    return await scrape_eldorado_dom(page, url)
+
+
+async def scrape_eldorado_dom(page, url: str) -> list:
+    """API 不可用时才加载 Eldorado 页面。"""
+    offer_limit = config.ELD_OFFER_PAGE_SIZE
 
     # API 不可用时再加载页面，解析 #other-sellers 下的 .offer-row。
     await page.set_extra_http_headers({
@@ -1002,7 +1021,117 @@ async def wait_for_crawl_interval(target, label):
     return True
 
 
+ELDORADO_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+ELDORADO_COOKIES = [
+    {
+        "name": name, "value": value, "domain": "www.eldorado.gg", "path": "/",
+        "expires": -1, "httpOnly": False, "secure": False, "sameSite": "Lax",
+    }
+    for name, value in (
+        ("eldoradogg_currencyPreference", "USD"),
+        ("eldoradogg_locale", "en-US"),
+    )
+]
+
+
+class CrawlSession:
+    """每个 worker 按需创建并复用请求/浏览器，退出时统一释放。"""
+
+    def __init__(self):
+        self.resources = AsyncExitStack()
+        self.playwright = None
+        self.browser = None
+        self.page = None
+        self.eldorado_request = None
+
+    async def __aenter__(self):
+        await self.resources.__aenter__()
+        return self
+
+    async def __aexit__(self, *args):
+        return await self.resources.__aexit__(*args)
+
+    async def get_playwright(self):
+        if self.playwright is None:
+            self.playwright = await self.resources.enter_async_context(async_playwright())
+        return self.playwright
+
+    async def get_browser(self, reason):
+        if self.browser is None:
+            playwright = await self.get_playwright()
+            print(f"  -> 按需启动 Chromium（{reason}）")
+            self.browser = await playwright.chromium.launch(**config.browser_launch_kwargs())
+            self.resources.push_async_callback(self.browser.close)
+        return self.browser
+
+    async def get_g2g_page(self):
+        if self.page is None:
+            browser = await self.get_browser("G2G 页面抓取")
+            context = await browser.new_context(
+                viewport=config.VIEWPORT,
+                user_agent=config.USER_AGENT,
+            )
+            await context.add_cookies([{
+                "name": "g2g_regional",
+                "value": '{"country":"US","language":"en","currency":"USD"}',
+                "domain": ".g2g.com",
+                "path": "/",
+            }])
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+            """)
+            self.page = await context.new_page()
+        return self.page
+
+    async def scrape_eldorado(self, url):
+        if self.eldorado_request is None:
+            playwright = await self.get_playwright()
+            self.eldorado_request = await playwright.request.new_context(
+                user_agent=ELDORADO_USER_AGENT,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                storage_state={"cookies": ELDORADO_COOKIES, "origins": []},
+            )
+            self.resources.push_async_callback(self.eldorado_request.dispose)
+            print("  -> ELD API 请求模式（成功时不启动 Chromium）")
+        items = await scrape_eldorado_api(self.eldorado_request, url)
+        if items is not None:
+            return items
+
+        browser = await self.get_browser("ELD API 不可用，DOM 兜底")
+        context = await browser.new_context(
+            viewport=config.VIEWPORT,
+            user_agent=ELDORADO_USER_AGENT,
+            locale="en-US",
+            timezone_id="America/New_York",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        try:
+            # 每个 DOM 兜底目标使用独立 context，不带 G2G cookie。
+            await context.add_cookies(ELDORADO_COOKIES)
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+                const origQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (p) =>
+                    p.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : origQuery(p);
+            """)
+            page = await context.new_page()
+            return await scrape_eldorado_dom(page, url)
+        finally:
+            await context.close()
+
+
 async def run(worker_index: int = 0, worker_count: int = 1):
+    run_started = perf_counter()
     # 读取目标
     targets = db.get_pending_targets(worker_index, worker_count)
     print(
@@ -1014,25 +1143,7 @@ async def run(worker_index: int = 0, worker_count: int = 1):
         print("[*] 当前分片没有爬取目标")
         return 0
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(**config.browser_launch_kwargs())
-        context = await browser.new_context(
-            viewport=config.VIEWPORT,
-            user_agent=config.USER_AGENT,
-        )
-        # 强制 USD：G2G 按 IP 自动切货币，注入 cookie 固定为 USD
-        await context.add_cookies([{
-            "name": "g2g_regional",
-            "value": '{"country":"US","language":"en","currency":"USD"}',
-            "domain": ".g2g.com",
-            "path": "/",
-        }])
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-        """)
-        page = await context.new_page()
-
+    async with CrawlSession() as session:
         total_saved = 0
         failed_count = 0
         for idx, target in enumerate(targets):
@@ -1068,6 +1179,7 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                 f"category={category_label})"
             )
 
+            target_started = perf_counter()
             try:
                 # 1 优先按绑定店铺加强，空名单按策略 Top3 加强；均保存全部候选。
                 crawl_type = target.get("crawl_type") or 0
@@ -1087,53 +1199,9 @@ async def run(worker_index: int = 0, worker_count: int = 1):
 
                 # 按 category 分流到不同爬取函数
                 if category == "ELD游戏币":
-                    # Eldorado 反爬较强，单独创建干净的 context，不带 G2G cookie
-                    eld_context = await browser.new_context(
-                        viewport=config.VIEWPORT,
-                        user_agent=(
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0.0.0 Safari/537.36"
-                        ),
-                        locale="en-US",
-                        timezone_id="America/New_York",
-                        extra_http_headers={
-                            "Accept-Language": "en-US,en;q=0.9",
-                        },
-                    )
-                    # 强制 USD + 英文：Eldorado 按 IP 自动切货币（如服务器在新加坡会变 SGD），
-                    # 注入货币偏好 cookie 让页面与接口都返回 USD。
-                    await eld_context.add_cookies([
-                        {
-                            "name": "eldoradogg_currencyPreference",
-                            "value": "USD",
-                            "domain": "www.eldorado.gg",
-                            "path": "/",
-                        },
-                        {
-                            "name": "eldoradogg_locale",
-                            "value": "en-US",
-                            "domain": "www.eldorado.gg",
-                            "path": "/",
-                        },
-                    ])
-                    await eld_context.add_init_script("""
-                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                        Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-                        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
-                        const origQuery = window.navigator.permissions.query;
-                        window.navigator.permissions.query = (p) =>
-                            p.name === 'notifications'
-                                ? Promise.resolve({ state: Notification.permission })
-                                : origQuery(p);
-                    """)
-                    eld_page = await eld_context.new_page()
-                    try:
-                        items = await scrape_eldorado_page(eld_page, url)
-                    finally:
-                        await eld_context.close()
+                    items = await session.scrape_eldorado(url)
                 elif category in {"金币", "游戏币"}:
+                    page = await session.get_g2g_page()
                     if enhance_enabled:
                         items = await scrape_other_offer_page(
                             page, url, refresh_unit_prices=True,
@@ -1142,6 +1210,7 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                     else:
                         items = await scrape_other_offer_page(page, url)
                 else:
+                    page = await session.get_g2g_page()
                     items = await scrape_page(page, url)
                 print(f"  -> 提取 {len(items)} 条")
 
@@ -1159,13 +1228,16 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                 # 发信号通知 PHP：该目标已爬完，由 PHP 消费通知后执行改价策略
                 db.insert_crawl_notify(target_id, version, inserted)
                 print(f"  -> 已写入爬取完成通知(crawl_notify)")
+                print(f"  -> 目标完成，耗时: {perf_counter() - target_started:.2f} 秒")
             except Exception as e:
                 failed_count += 1
-                print(f"  -> 错误: {e}")
+                print(f"  -> 错误: {e}（目标耗时: {perf_counter() - target_started:.2f} 秒）")
 
-        await browser.close()
-        print(f"\n[*] 分片完成! 共保存 {total_saved} 条数据，失败 {failed_count} 个目标")
-        return 1 if failed_count else 0
+    print(
+        f"\n[*] 分片完成! 共保存 {total_saved} 条数据，失败 {failed_count} 个目标，"
+        f"worker 耗时: {perf_counter() - run_started:.2f} 秒"
+    )
+    return 1 if failed_count else 0
 
 
 def parse_args(argv=None):

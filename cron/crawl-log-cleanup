@@ -1,0 +1,7 @@
+# 上传项目后，以 root 安装：
+# cp /www/wwwroot/game_crawl/cron/crawl-log-cleanup /etc/cron.d/crawl-log-cleanup
+# chmod 644 /etc/cron.d/crawl-log-cleanup
+# 每小时第 17 分钟检查；输出交给 cron，不另外积累清理日志。
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 * * * * root /bin/bash /www/wwwroot/game_crawl/cleanup_logs.sh

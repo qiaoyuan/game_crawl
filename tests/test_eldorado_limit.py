@@ -12,6 +12,7 @@ class EldoradoFirstPageTests(unittest.IsolatedAsyncioTestCase):
         records = [{"offer": {"id": str(i), "pricePerUnitInUSD": {"amount": i + 1}},
                     "user": {"username": f"seller{i}"}} for i in range(20)]
         response = MagicMock(ok=True, status=200)
+        response.dispose = AsyncMock()
         response.json = AsyncMock(return_value={"results": records})
         page.request.get = AsyncMock(return_value=response)
         url = ("https://www.eldorado.gg/poe-2-currency/g/220?"
@@ -28,10 +29,12 @@ class EldoradoFirstPageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["offerSortingCriterion"], ["Cheapest"])
         self.assertEqual([row["seller_name"] for row in rows], [f"seller{i}" for i in range(8)])
         page.goto.assert_not_called()
+        response.dispose.assert_awaited_once()
 
     async def test_eld_limit_is_independent_of_g2g_limit(self):
         page = MagicMock()
         response = MagicMock(ok=True, status=200)
+        response.dispose = AsyncMock()
         response.json = AsyncMock(return_value={"results": [
             {"offer": {"id": str(i), "pricePerUnitInUSD": {"amount": i + 1}},
              "user": {"username": f"seller{i}"}} for i in range(20)]})
@@ -52,6 +55,7 @@ class EldoradoFirstPageTests(unittest.IsolatedAsyncioTestCase):
         records[2]["user"]["id"] = "OtherOwn"
         records[2]["offer"]["pricePerUnitInUSD"] = ["invalid"]
         response = MagicMock(ok=True, status=200)
+        response.dispose = AsyncMock()
         response.json = AsyncMock(return_value={"results": records})
         page.request.get = AsyncMock(return_value=response)
         with patch.object(config, "CRAWL_EXCLUDE_STORES", "Vivi_Store,otherown"), \
@@ -64,6 +68,7 @@ class EldoradoFirstPageTests(unittest.IsolatedAsyncioTestCase):
     async def test_api_all_excluded_returns_zero_without_dom_fallback(self):
         page = MagicMock()
         response = MagicMock(ok=True, status=200)
+        response.dispose = AsyncMock()
         response.json = AsyncMock(return_value={"results": [
             {"user": {"username": "Vivi_Store"}, "offer": {"pricePerUnitInUSD": ["invalid"]}},
         ]})
