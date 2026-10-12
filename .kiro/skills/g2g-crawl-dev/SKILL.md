@@ -21,9 +21,9 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 | `crawl_server` | 1 | 本机只读取所属服务器 1/2 的任务 |
 | `CRAWL_OFFER_LIMIT` | 10 | G2G 当前列表按展示顺序取前 N 条，正整数 |
 | `ELD_OFFER_PAGE_SIZE` | 8 | ELD 游戏币第一页的条数上限，正整数 |
-| `CRAWL_WORKER_COUNT` | 1 | 启动脚本的 worker 数，正整数系统环境变量 |
+| `CRAWL_WORKER_COUNT` | 1 | 启动脚本的 worker 数，可在 `.env.prod` 中配置，系统环境变量优先 |
 
-`CRAWL_WORKER_COUNT` 由 shell 启动脚本读取，不会自动从 Python 的 dotenv 配置加载。以上条数控制每个目标的竞品数量，不控制领取的任务数量。
+`CRAWL_WORKER_COUNT` 由 shell 启动脚本读取：系统环境变量已设置时优先使用，否则只解析生产目录 `.env.prod` 的同名字段；文件或字段缺失时默认 1。支持空白、单/双引号、行尾注释、CRLF 和 `export` 前缀，同名字段取最后一项；配置内容不作为 shell 执行，也不加载其他字段。空值、非整数或小于 1 时在启动前报错。修改配置对下一次启动生效，不调整运行中的 worker；cron 中设置的环境变量同样会覆盖文件。抓取条数控制每个目标的竞品数量，不控制领取的任务数量。
 
 - G2G 金币/游戏币走 `scrape_other_offer_page`；其他分类走通用 `scrape_page`。两条 G2G 卡片路径都应用 G2G 上限，提取后再选择加强对象。达到上限停止滚动等待；未达到时沿用数量稳定后结束的加载逻辑，不向后补齐加强店铺。
 - `ELD游戏币` 走 `scrape_eldorado_page`，优先 offers API，失败时 DOM 兜底。API 固定 `pageIndex=1`，`pageSize` 使用 ELD 上限；保留商品属性与排序，URL 的分页参数不能覆盖配置。API 返回超过上限也截断；DOM 兜底用同一上限，不滚动加载更多。两个平台的条数独立。
@@ -58,7 +58,7 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 
 ## 启动、日志与部署
 
-- Linux 入口为 `bash /www/wwwroot/game_crawl/run_crawl_and_consume.sh`，默认单 worker。临时双 worker 可用 `CRAWL_WORKER_COUNT=2 bash /www/wwwroot/game_crawl/run_crawl_and_consume.sh`。
+- Linux 入口为 `bash /www/wwwroot/game_crawl/run_crawl_and_consume.sh`，未配置时单 worker，`.env.prod` 写 `CRAWL_WORKER_COUNT=2` 后普通启动即为双 worker。临时覆盖可用 `CRAWL_WORKER_COUNT=2 bash /www/wwwroot/game_crawl/run_crawl_and_consume.sh`。
 - 脚本用 `logs/crawl.lock` 的非阻塞 flock 防止同一脚本重叠；上一轮未结束时本次跳过。此锁不覆盖绕过脚本直接执行 Python 的进程，也不是跨服务器数据库任务锁。
 - `xvfb-run -a -n` 从 90+worker index 开始选择空闲显示号。脚本显式设置 APP_ENV=prod、自带 Chromium、headed 模式，须有可用 Xvfb。`Missing X server or $DISPLAY` 是浏览器启动错误，不能当作详情选择器错误。
 - 日志使用固定 `crawl.log`、`crawl_worker_N.log`、`xvfb_worker_N.log`；不为每轮生成时间戳日志文件。当前脚本未做日志轮转，不能宣称大小已受限。
@@ -74,6 +74,6 @@ rtk proxy bash -n run_crawl_and_consume.sh
 rtk git diff --check
 ```
 
-`test_other_offer_prices.py` 覆盖加强选择、异步价格归属和列表上限；`test_eldorado_limit.py` 覆盖独立 ELD 上限与第一页；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_workers.py` 覆盖分片、默认进程数、撞锁及失败汇总。
+`test_other_offer_prices.py` 覆盖加强选择、异步价格归属和列表上限；`test_eldorado_limit.py` 覆盖独立 ELD 上限与第一页；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_workers.py` 覆盖分片、dotenv 进程数加载、环境变量覆盖、非法值拒绝、配置不执行、撞锁及失败汇总。
 
 每次相关改动完成后按根目录 AGENTS.md 对照最终源码更新本 skill；独立工具变化另同步既有 CodeBuddy skill。替换过时约定，不写改动流水账、凭证或未经验证的部署状态。

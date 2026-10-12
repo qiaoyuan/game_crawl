@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import io
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -86,6 +87,60 @@ fake_worker() {{
                     self.assertIn("--worker-count 1 --worker-index 0", calls[0])
                 else:
                     self.assertFalse(events.exists())
+
+    def test_launcher_reads_dotenv_worker_count_and_environment_takes_precedence(self):
+        launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()
+        cases = [
+            ("CRAWL_WORKER_COUNT=2\n", None, 2),
+            ('export CRAWL_WORKER_COUNT = "2" # workers\r\n', None, 2),
+            ("CRAWL_WORKER_COUNT='2'\n", None, 2),
+            ("CRAWL_WORKER_COUNT=1\nCRAWL_WORKER_COUNT=2\n", None, 2),
+            ("OTHER_SETTING=2\n", None, 1),
+            ("CRAWL_WORKER_COUNT=2\n", "1", 1),
+            ("CRAWL_WORKER_COUNT=invalid\n", "2", 2),
+        ]
+        for dotenv, override, count in cases:
+            with self.subTest(dotenv=dotenv, override=override), tempfile.TemporaryDirectory() as directory:
+                # Include unrelated shell syntax to verify that loading dotenv never executes it.
+                marker = Path(directory) / "unexpected"
+                (Path(directory) / ".env.prod").write_text(
+                    dotenv + f"UNRELATED=$(touch {marker})\n"
+                )
+                script = launcher.replace("/www/wwwroot/game_crawl", directory)
+                script = script.replace("/usr/bin/xvfb-run", "fake_worker")
+                script = script.replace("/usr/bin/flock", "fake_flock")
+                prelude = f'''
+fake_flock() {{ return 0; }}
+fake_worker() {{ echo "$*" >> "{directory}/events"; }}
+'''
+                launcher_env = os.environ.copy()
+                launcher_env.pop("CRAWL_WORKER_COUNT", None)
+                if override is not None:
+                    launcher_env["CRAWL_WORKER_COUNT"] = override
+                result = subprocess.run(["bash", "-c", prelude + script], text=True,
+                                        capture_output=True, timeout=10, env=launcher_env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = (Path(directory) / "events").read_text().splitlines()
+                self.assertEqual(len(calls), count)
+                self.assertEqual({call.split("--worker-index ")[1] for call in calls},
+                                 {str(index) for index in range(count)})
+                self.assertTrue(all(f"--worker-count {count}" in call for call in calls))
+                self.assertFalse(marker.exists())
+
+    def test_launcher_rejects_invalid_dotenv_worker_count_before_launch(self):
+        launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()
+        for value in ("0", "-1", "abc", "", "$(touch unexpected)"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / ".env.prod").write_text(f"CRAWL_WORKER_COUNT={value}\n")
+                script = launcher.replace("/www/wwwroot/game_crawl", directory)
+                launcher_env = os.environ.copy()
+                launcher_env.pop("CRAWL_WORKER_COUNT", None)
+                result = subprocess.run(["bash", "-c", script], text=True, capture_output=True,
+                                        timeout=10, env=launcher_env, cwd=directory)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("CRAWL_WORKER_COUNT 必须为正整数", result.stderr)
+                self.assertFalse((Path(directory) / "logs").exists())
+                self.assertFalse((Path(directory) / "unexpected").exists())
 
     def test_launcher_runs_both_workers_and_waits_after_failure(self):
         # Exercise the actual launcher, replacing only server paths and external

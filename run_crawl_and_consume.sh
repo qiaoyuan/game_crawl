@@ -2,7 +2,32 @@
 
 LOG_DIR="/www/wwwroot/game_crawl/logs"
 LOG_FILE="$LOG_DIR/crawl.log"
-WORKER_COUNT=${CRAWL_WORKER_COUNT:-1}
+ENV_FILE="/www/wwwroot/game_crawl/.env.prod"
+
+# 系统环境变量优先；未设置时只解析 .env.prod 的 worker 数，不执行配置内容。
+WORKER_COUNT=${CRAWL_WORKER_COUNT-}
+if [ "${CRAWL_WORKER_COUNT+x}" != x ]; then
+    WORKER_COUNT=1
+    if [ -f "$ENV_FILE" ]; then
+        WORKER_COUNT=$(awk '
+            /^[[:space:]]*(export[[:space:]]+)?CRAWL_WORKER_COUNT[[:space:]]*=/ {
+                value = $0
+                sub(/^[^=]*=[[:space:]]*/, "", value)
+                sub(/\r$/, "", value)
+                sub(/[[:space:]]+#.*$/, "", value)
+                sub(/[[:space:]]*$/, "", value)
+                quote = substr(value, 1, 1)
+                if ((quote == "\"" || quote == sprintf("%c", 39)) &&
+                    substr(value, length(value), 1) == quote) {
+                    value = substr(value, 2, length(value) - 2)
+                }
+                worker_count = value
+                found = 1
+            }
+            END { print found ? worker_count : 1 }
+        ' "$ENV_FILE") || exit 2
+    fi
+fi
 if ! [[ "$WORKER_COUNT" =~ ^[1-9][0-9]*$ ]]; then
     echo "CRAWL_WORKER_COUNT 必须为正整数" >&2
     exit 2
