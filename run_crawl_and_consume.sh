@@ -39,16 +39,37 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
 }
 
-# 宝塔重复触发时跳过仍在运行的上一轮，避免 worker、日志及显示号冲突。
+# 最多保留一个等待触发，避免重复 cron/手动启动积累排队进程。
+exec 8>"$LOG_DIR/crawl_wait.lock" || exit 1
+/usr/bin/flock -n 8
+waiter_exit=$?
+if [ "$waiter_exit" -eq 1 ]; then
+    log "已有触发正在等候上一轮，本次触发跳过"
+    exit 0
+elif [ "$waiter_exit" -ne 0 ]; then
+    log "获取爬虫等待锁失败，退出码: $waiter_exit"
+    exit "$waiter_exit"
+fi
+
+# 先尝试立即执行；30 秒边界撞锁时等待上一轮退出，不丢掉整轮。
 exec 9>"$LOG_DIR/crawl.lock" || exit 1
 /usr/bin/flock -n 9
 lock_exit=$?
 if [ "$lock_exit" -eq 1 ]; then
-    exit 0
-elif [ "$lock_exit" -ne 0 ]; then
+    log "上一轮仍在运行，本次触发最多等锁 30 秒"
+    /usr/bin/flock -w 30 9
+    lock_exit=$?
+    if [ "$lock_exit" -eq 1 ]; then
+        log "等锁超过 30 秒，本次触发跳过"
+        exit 0
+    fi
+fi
+if [ "$lock_exit" -ne 0 ]; then
     log "获取爬虫运行锁失败，退出码: $lock_exit"
     exit "$lock_exit"
 fi
+# 已取得运行锁，释放等待名额；后续子进程只继承运行锁。
+exec 8>&-
 log "开始执行爬虫任务，进程数: $WORKER_COUNT"
 
 cd /www/wwwroot/game_crawl || {

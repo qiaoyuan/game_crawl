@@ -32,7 +32,8 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 ## 任务、分片与快照
 
 - `get_pending_targets` 查询启用、未删除、`crawl_server` 相同的目标，按 `MOD(id, worker_count)=worker_index` 分片并按 id 排序。worker index 从 0 开始，必须小于正数 worker count。
-- 跳过无有效 `game_product_id`、无 URL 的任务。`crawl_interval` 按秒，与 `last_crawl_at` 决定是否到期；不是分片数量。
+- 跳过无有效 `game_product_id`、无 URL 的任务。`crawl_interval` 是两次开始的最小间隔（秒），30 表示开始间隔 30 秒，不额外叠加基础 30 秒；0/缺失表示每轮调度执行，首次抓取不等待。Python 在版本递增前记录本轮开始时间，完整保存后将该时间写入 `last_crawl_at`，下次到期时间为上次成功轮次的开始时间加间隔，抓取耗时不追加到间隔中。
+- 已到期立即执行；距到期不超过 30 秒时使用异步 sleep 等到期后在本轮执行，不提前抓取；剩余超过 30 秒才跳过。日志区分等待和跳过，格式错误的历史时间仍告警后继续抓取。旧版本保存的完成时间无需迁移，首个成功轮次后自然换成开始时间。
 - `crawl_type`：0 默认，1 店铺加强；兼容数字字符串、历史 `default/top3`，缺失/空值按 0，未知类型报错。
 - 每个目标抓取前递增 `crawl_target.version`，本轮所有 `crawl_data` 带同一 `target_id`、`game_product_id` 和 version。加强失败仍可能已递增版本。
 - 成功顺序：保存完整候选 → 更新 `last_crawl_at` → 插入 `crawl_notify(status=0)`，通知带目标、准确 version、实际保存条数。成功零条也可发零条通知。PHP 按通知 version 读取快照，不能只读最新版本。
@@ -54,12 +55,13 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 - 优先读取 `.vue-portal-target .pricing-container` 内“单价/Unit Price”，保留价格精度、币种，更新 price/unit_price/currency，标记 `unit_price_source=offer_detail`。不能使用列表最低/from 价格替代。
 - G2G 数量为 1 时可能隐藏单价节点。仅在可见详情容器唯一、数量输入唯一且明确为 1、金额标签为总金额/总价/Total amount、币种可确认，并通过店铺与金额刷新校验时，将这一件的详情金额作为单价，标记 `offer_detail_single_unit`；多件总价不作为单价。
 - 每家定位、DOM 读取、点击、详情等待及清理统一受默认 15 秒期限约束；点击使用 `no_wait_after=True`，随后单独等待详情。日志记录店铺、阶段、价格和耗时。
-- 候选详情失败时终止该目标，不保存该轮、不更新完成时间、不发完成通知，不静默回退旧列表价。其他未加强行保持列表数据。
+- 候选详情失败时终止该目标，不保存该轮、不推进 `last_crawl_at`、不发完成通知，不静默回退旧列表价。其他未加强行保持列表数据。
 
 ## 启动、日志与部署
 
 - Linux 入口为 `bash /www/wwwroot/game_crawl/run_crawl_and_consume.sh`，未配置时单 worker，`.env.prod` 写 `CRAWL_WORKER_COUNT=2` 后普通启动即为双 worker。临时覆盖可用 `CRAWL_WORKER_COUNT=2 bash /www/wwwroot/game_crawl/run_crawl_and_consume.sh`。
-- 脚本用 `logs/crawl.lock` 的非阻塞 flock 防止同一脚本重叠；上一轮未结束时本次跳过。此锁不覆盖绕过脚本直接执行 Python 的进程，也不是跨服务器数据库任务锁。
+- 脚本用 `logs/crawl.lock` 的 flock 防止同一脚本重叠，先非阻塞尝试；上一轮仍运行时使用 `flock -w 30` 最多等锁 30 秒，上一轮退出后本次立即执行。等锁超时记日志并返回 0；锁本身报错记录并返回非零。额外用 `logs/crawl_wait.lock` 的非阻塞锁限制最多一个等锁触发，重复触发已有等待者时记日志后退出；取得运行锁后立即关闭等待锁 fd，再启动 workers，子进程仅继承运行锁。两种锁文件均不可在运行/等待期间删除，否则不同 inode 会破坏互斥。
+- cron 可在每分钟的 0/30 秒各触发一次，配合上述开始间隔、临近到期等待和有界等锁，避免 30 秒边界上的上一轮退出延迟直接漏掉本次。最多一轮执行及一个触发等锁，不累计排队；持续长于调度周期时实际频率仍受抓取耗时限制，等待名额已占或等锁超过 30 秒时触发仍会跳过，不能承诺硬实时。锁不覆盖绕过脚本直接执行 Python 的进程，也不是跨服务器数据库任务锁。
 - `xvfb-run -a -n` 从 90+worker index 开始选择空闲显示号。脚本显式设置 APP_ENV=prod、自带 Chromium、headed 模式，须有可用 Xvfb。`Missing X server or $DISPLAY` 是浏览器启动错误，不能当作详情选择器错误。
 - 日志使用固定 `crawl.log`、`crawl_worker_N.log`、`xvfb_worker_N.log`；不为每轮生成时间戳日志文件。当前脚本未做日志轮转，不能宣称大小已受限。
 - `deploy_prod.sh` 会 rsync、安装依赖和验证环境，属于真实部署；其帮助文字可能滞后，以启动脚本为准。维护规范不等于运行部署。迁移文件存在也不代表已执行；有字段变更时同步后台模型、验证、UI 和迁移。
@@ -74,6 +76,6 @@ rtk proxy bash -n run_crawl_and_consume.sh
 rtk git diff --check
 ```
 
-`test_other_offer_prices.py` 覆盖加强选择、异步价格归属和列表上限；`test_eldorado_limit.py` 覆盖独立 ELD 上限与第一页；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_workers.py` 覆盖分片、dotenv 进程数加载、环境变量覆盖、非法值拒绝、配置不执行、撞锁及失败汇总。
+`test_other_offer_prices.py` 覆盖加强选择、异步价格归属和列表上限；`test_eldorado_limit.py` 覆盖独立 ELD 上限与第一页；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_interval.py` 用模拟时钟覆盖连续三轮 ELD 目标、抓取耗时与提前触发、等待/跳过边界、失败不推进时间及开始时间持久化；`test_crawl_workers.py` 覆盖分片、dotenv 进程数加载、环境变量覆盖、非法值拒绝、配置不执行、等锁成功/超时/错误及失败汇总，并以操作系统 flock 验证一轮运行、一个等待者、额外触发退出和两轮无重叠。
 
 每次相关改动完成后按根目录 AGENTS.md 对照最终源码更新本 skill；独立工具变化另同步既有 CodeBuddy skill。替换过时约定，不写改动流水账、凭证或未经验证的部署状态。

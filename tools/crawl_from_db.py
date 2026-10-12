@@ -10,6 +10,8 @@ import asyncio
 import json
 import math
 import re
+import time
+from datetime import datetime
 from time import perf_counter
 from playwright.async_api import async_playwright
 from g2g import config, db
@@ -942,6 +944,39 @@ async def scrape_eldorado_page(page, url: str) -> list:
     return items
 
 
+async def wait_for_crawl_interval(target, label):
+    """临近到期时等到本轮执行，避免 cron 秒级偏差造成整轮跳过。"""
+    last_crawl_at = target.get("last_crawl_at")
+    try:
+        interval_seconds = max(0, int(target.get("crawl_interval") or 0))
+        if not interval_seconds or not last_crawl_at:
+            return True
+        last_started_at = (
+            last_crawl_at if isinstance(last_crawl_at, datetime)
+            else datetime.strptime(str(last_crawl_at), "%Y-%m-%d %H:%M:%S")
+        )
+        remaining = last_started_at.timestamp() + interval_seconds - time.time()
+    except (TypeError, ValueError, OverflowError, OSError) as e:
+        print(f"  {label} 间隔时间解析异常: {e}，继续执行")
+        return True
+
+    if remaining <= 0:
+        return True
+    # cron 每 30 秒触发一次：最多等一个调度周期，不提前爬取。
+    if remaining > 30:
+        print(
+            f"  {label} 跳过: 未到间隔时间，还需等待约 {math.ceil(remaining)} 秒"
+            f"（开始间隔 {interval_seconds} 秒）"
+        )
+        return False
+    print(
+        f"  {label} 等待约 {remaining:.1f} 秒后执行"
+        f"（开始间隔 {interval_seconds} 秒）"
+    )
+    await asyncio.sleep(remaining)
+    return True
+
+
 async def run(worker_index: int = 0, worker_count: int = 1):
     # 读取目标
     targets = db.get_pending_targets(worker_index, worker_count)
@@ -996,28 +1031,9 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                 print(f"  [{idx+1}/{len(targets)}] 跳过: 无 URL")
                 continue
 
-            # 到期时间 = 上次爬取完成时间 + crawl_interval（秒，如 1 分钟为 60）。
-            # 未配置或配置为 0 时不限制间隔；首次爬取不等待。
-            crawl_interval = target.get("crawl_interval")
-            last_crawl_at = target.get("last_crawl_at")
-            if last_crawl_at:
-                try:
-                    interval_seconds = max(0, int(crawl_interval or 0))
-                    if hasattr(last_crawl_at, "timestamp"):
-                        last_ts = last_crawl_at.timestamp()
-                    else:
-                        from datetime import datetime as dt
-                        last_ts = dt.strptime(str(last_crawl_at), "%Y-%m-%d %H:%M:%S").timestamp()
-                    import time
-                    remaining = math.ceil(last_ts + interval_seconds - time.time())
-                    if remaining > 0:
-                        print(
-                            f"  [{idx+1}/{len(targets)}] {name} 跳过: "
-                            f"未到间隔时间，还需等待约 {remaining} 秒（总间隔 {interval_seconds} 秒）"
-                        )
-                        continue
-                except Exception as e:
-                    print(f"  [{idx+1}/{len(targets)}] 间隔时间解析异常: {e}，继续执行")
+            # 间隔按成功轮次的开始时间计算，抓取耗时不再追加到间隔中。
+            if not await wait_for_crawl_interval(target, f"[{idx+1}/{len(targets)}] {name}"):
+                continue
 
             platform = "eldorado" if "eldorado.gg" in url else "g2g"
             category_label = category or "未设置类别"
@@ -1040,8 +1056,9 @@ async def run(worker_index: int = 0, worker_count: int = 1):
 
                 # 爬取前先将版本号 +1，本批数据全部使用新版本号写入。
                 # PHP 侧通过 crawl_target.version 对应 crawl_data.version 做改价策略。
+                crawl_started_at = datetime.fromtimestamp(time.time()).replace(microsecond=0)
                 version = db.increment_version(target_id)
-                print(f"  -> version={version}")
+                print(f"  -> version={version}, 开始时间={crawl_started_at}")
 
                 # 按 category 分流到不同爬取函数
                 if category == "ELD游戏币":
@@ -1113,7 +1130,7 @@ async def run(worker_index: int = 0, worker_count: int = 1):
                 total_saved += inserted
                 print(f"  -> 新增 {inserted} 条")
 
-                db.update_last_crawl(target_id)
+                db.update_last_crawl(target_id, crawl_started_at)
                 # 发信号通知 PHP：该目标已爬完，由 PHP 消费通知后执行改价策略
                 db.insert_crawl_notify(target_id, version, inserted)
                 print(f"  -> 已写入爬取完成通知(crawl_notify)")

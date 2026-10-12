@@ -3,9 +3,12 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -87,6 +90,117 @@ fake_worker() {{
                     self.assertIn("--worker-count 1 --worker-index 0", calls[0])
                 else:
                     self.assertFalse(events.exists())
+
+    def test_launcher_waits_on_boundary_and_reports_timeout_or_lock_error(self):
+        launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()
+        for wait_exit, expected_exit in ((0, 0), (1, 0), (2, 2)):
+            with self.subTest(wait_exit=wait_exit), tempfile.TemporaryDirectory() as directory:
+                script = launcher.replace("/www/wwwroot/game_crawl", directory)
+                script = script.replace("/usr/bin/xvfb-run", "fake_worker")
+                script = script.replace("/usr/bin/flock", "fake_flock")
+                prelude = f'''
+unset CRAWL_WORKER_COUNT
+fake_flock() {{
+    echo "$*" >> "{directory}/locks"
+    if [ "$*" = "-n 8" ]; then return 0; fi
+    if [ "$*" = "-n 9" ]; then return 1; fi
+    return {wait_exit}
+}}
+fake_worker() {{ echo "$*" >> "{directory}/events"; }}
+'''
+                result = subprocess.run(["bash", "-c", prelude + script], text=True,
+                                        capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, expected_exit, result.stderr)
+                self.assertEqual((Path(directory) / "locks").read_text().splitlines(),
+                                 ["-n 8", "-n 9", "-w 30 9"])
+                log = (Path(directory) / "logs/crawl.log").read_text()
+                self.assertIn("最多等锁 30 秒", log)
+                if wait_exit == 0:
+                    self.assertEqual(len((Path(directory) / "events").read_text().splitlines()), 1)
+                else:
+                    self.assertFalse((Path(directory) / "events").exists())
+                    self.assertIn("等锁超过 30 秒" if wait_exit == 1 else "获取爬虫运行锁失败", log)
+
+    def test_launcher_keeps_one_waiter_and_runs_it_after_previous_round(self):
+        # Exercise OS flock semantics on Linux/macOS without requiring a flock CLI.
+        launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flock_tool = root / "flock.py"
+            flock_tool.write_text('''
+import fcntl
+import sys
+import time
+
+fd = int(sys.argv[-1])
+deadline = time.monotonic() + (float(sys.argv[2]) if sys.argv[1] == "-w" else 0)
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(1)
+        time.sleep(0.01)
+''')
+            script = launcher.replace("/www/wwwroot/game_crawl", directory)
+            script = script.replace("/usr/bin/xvfb-run", "fake_worker")
+            script = script.replace("/usr/bin/flock", f"{shlex.quote(sys.executable)} {shlex.quote(str(flock_tool))}")
+            prelude = f'''
+unset CRAWL_WORKER_COUNT
+fake_worker() {{
+    echo "start $ROUND_NAME" >> "{directory}/events"
+    if [ "$ROUND_NAME" = first ]; then
+        while [ ! -e "{directory}/release" ]; do sleep 0.02; done
+    fi
+    echo "done $ROUND_NAME" >> "{directory}/events"
+}}
+'''
+            processes = []
+
+            def launch(name):
+                env = os.environ.copy()
+                env["ROUND_NAME"] = name
+                process = subprocess.Popen(["bash", "-c", prelude + script], env=env,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                processes.append(process)
+                return process
+
+            def wait_for_text(path, expected):
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if path.exists() and expected in path.read_text():
+                        return
+                    time.sleep(0.01)
+                self.fail(f"Timed out waiting for {expected!r}")
+
+            try:
+                first = launch("first")
+                wait_for_text(root / "events", "start first")
+                second = launch("second")
+                wait_for_text(root / "logs/crawl.log", "最多等锁 30 秒")
+                third = launch("third")
+                _, errors = third.communicate(timeout=5)
+                self.assertEqual(third.returncode, 0, errors)
+                self.assertEqual((root / "events").read_text().splitlines(), ["start first"])
+                self.assertIn("已有触发正在等候上一轮", (root / "logs/crawl.log").read_text())
+
+                (root / "release").touch()
+                for process in (first, second):
+                    _, errors = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 0, errors)
+                self.assertEqual((root / "events").read_text().splitlines(),
+                                 ["start first", "done first", "start second", "done second"])
+            finally:
+                (root / "release").touch()
+                for process in processes:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
 
     def test_launcher_reads_dotenv_worker_count_and_environment_takes_precedence(self):
         launcher = (Path(__file__).resolve().parents[1] / "run_crawl_and_consume.sh").read_text()

@@ -36,14 +36,14 @@ def get_pending_targets(worker_index: int = 0, worker_count: int = 1) -> list:
         conn.close()
 
 
-def update_last_crawl(target_id: int):
-    """更新 crawl_target 的最后爬取时间"""
+def update_last_crawl(target_id: int, started_at: datetime):
+    """成功保存后记录本轮开始时间，作为下一轮间隔的基准。"""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE crawl_target SET last_crawl_at = NOW() WHERE id = %s",
-                (target_id,),
+                "UPDATE crawl_target SET last_crawl_at = %s WHERE id = %s",
+                (started_at, target_id),
             )
         conn.commit()
     finally:

@@ -2,6 +2,7 @@ import asyncio
 import json
 import sqlite3
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from g2g import db
@@ -167,7 +168,9 @@ class CrawlFilterTests(unittest.TestCase):
                                                            policies=compile_policies(load.return_value) if not stores else None)
                         save.assert_called_once_with(10, "g2g", expected, game_product_id=1, version=8)
                         notify.assert_called_once_with(10, 8, len(expected))
-                        update.assert_called_once_with(10)
+                        update.assert_called_once()
+                        self.assertEqual(update.call_args.args[0], 10)
+                        self.assertIsInstance(update.call_args.args[1], datetime)
 
 
 if __name__ == "__main__":
