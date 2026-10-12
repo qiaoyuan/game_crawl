@@ -58,6 +58,9 @@ ELD_OFFER_PAGE_SIZE = int(os.environ.get("ELD_OFFER_PAGE_SIZE", "8"))
 if ELD_OFFER_PAGE_SIZE < 1:
     raise ValueError("ELD_OFFER_PAGE_SIZE 必须为正整数")
 
+# 全局排除店铺：在加强选择、价格处理和入库前跳过，支持逗号分隔多个名字。
+CRAWL_EXCLUDE_STORES = os.environ.get("CRAWL_EXCLUDE_STORES", "")
+
 # 浏览器
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

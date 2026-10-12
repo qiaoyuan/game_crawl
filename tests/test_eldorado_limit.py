@@ -43,6 +43,36 @@ class EldoradoFirstPageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["pageSize"], ["5"])
         self.assertEqual(params["pageIndex"], ["1"])
 
+    async def test_excludes_api_shops_before_parsing_prices_without_refilling(self):
+        page = MagicMock()
+        records = [{"offer": {"id": str(i), "pricePerUnitInUSD": {"amount": i + 1}},
+                    "user": {"username": f"seller{i}"}} for i in range(20)]
+        records[0]["user"]["username"] = " vivi_store "
+        records[0]["offer"]["pricePerUnitInUSD"] = ["invalid"]
+        records[2]["user"]["id"] = "OtherOwn"
+        records[2]["offer"]["pricePerUnitInUSD"] = ["invalid"]
+        response = MagicMock(ok=True, status=200)
+        response.json = AsyncMock(return_value={"results": records})
+        page.request.get = AsyncMock(return_value=response)
+        with patch.object(config, "CRAWL_EXCLUDE_STORES", "Vivi_Store,otherown"), \
+             patch.object(config, "ELD_OFFER_PAGE_SIZE", 8):
+            rows = await scrape_eldorado_page(page, "https://www.eldorado.gg/currency/g/220")
+        self.assertEqual([row["seller_name"] for row in rows],
+                         [f"seller{i}" for i in (1, 3, 4, 5, 6, 7)])
+        page.goto.assert_not_called()
+
+    async def test_api_all_excluded_returns_zero_without_dom_fallback(self):
+        page = MagicMock()
+        response = MagicMock(ok=True, status=200)
+        response.json = AsyncMock(return_value={"results": [
+            {"user": {"username": "Vivi_Store"}, "offer": {"pricePerUnitInUSD": ["invalid"]}},
+        ]})
+        page.request.get = AsyncMock(return_value=response)
+        with patch.object(config, "CRAWL_EXCLUDE_STORES", "Vivi_Store"):
+            rows = await scrape_eldorado_page(page, "https://www.eldorado.gg/currency/g/220")
+        self.assertEqual(rows, [])
+        page.goto.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

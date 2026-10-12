@@ -21,6 +21,7 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 | `crawl_server` | 1 | 本机只读取所属服务器 1/2 的任务 |
 | `CRAWL_OFFER_LIMIT` | 10 | G2G 当前列表按展示顺序取前 N 条，正整数 |
 | `ELD_OFFER_PAGE_SIZE` | 8 | ELD 游戏币第一页的条数上限，正整数 |
+| `CRAWL_EXCLUDE_STORES` | 空字符串 | 全局排除多个店铺名/卖家标识，排除价格处理、加强和入库 |
 | `CRAWL_WORKER_COUNT` | 1 | 启动脚本的 worker 数，可在 `.env.prod` 中配置，系统环境变量优先 |
 
 `CRAWL_WORKER_COUNT` 由 shell 启动脚本读取：系统环境变量已设置时优先使用，否则只解析生产目录 `.env.prod` 的同名字段；文件或字段缺失时默认 1。支持空白、单/双引号、行尾注释、CRLF 和 `export` 前缀，同名字段取最后一项；配置内容不作为 shell 执行，也不加载其他字段。空值、非整数或小于 1 时在启动前报错。修改配置对下一次启动生效，不调整运行中的 worker；cron 中设置的环境变量同样会覆盖文件。抓取条数控制每个目标的竞品数量，不控制领取的任务数量。
@@ -28,6 +29,8 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 - G2G 金币/游戏币走 `scrape_other_offer_page`；其他分类走通用 `scrape_page`。两条 G2G 卡片路径都应用 G2G 上限，提取后再选择加强对象。达到上限停止滚动等待；未达到时沿用数量稳定后结束的加载逻辑，不向后补齐加强店铺。
 - `ELD游戏币` 走 `scrape_eldorado_page`，优先 offers API，失败时 DOM 兜底。API 固定 `pageIndex=1`，`pageSize` 使用 ELD 上限；保留商品属性与排序，URL 的分页参数不能覆盖配置。API 返回超过上限也截断；DOM 兜底用同一上限，不滚动加载更多。两个平台的条数独立。
 - 不要把 ELD 游戏币的 API 规则描述成所有独立工具或所有分类均已支持。
+- `CRAWL_EXCLUDE_STORES` 与其他 Python 配置一样由 `.env`/`.env.prod` 加载，系统环境变量优先；未配置或空值不排除。支持英文/中文逗号、换行及 JSON 数组，复用 identifiers 归一化大小写、HTML 实体和空白，对 seller_id/seller_name 完整匹配，不按子串命中。生产两台服务器需各自配置，上线模板不代表真实环境已同步。
+- 先按 G2G/ELD 上限取得当前列表范围，再排除全局名单；G2G 两条卡片路径与 ELD DOM 在 Python 价格/好评率处理之前过滤，ELD API 在识别 user/offer 卖家身份后、报价换算之前跳过。被排除行不进入 Top3/绑定店铺加强，也不进入 crawl_data；加强名单与策略白名单不能覆盖全局排除。过滤后不向上限之外补抓，实际保存和通知条数可能减少。ELD API 本范围全部被排除时成功返回空列表，不因为排除而回退 DOM 或翻页。
 
 ## 任务、分片与快照
 
@@ -41,7 +44,7 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 
 ## 店铺加强选择
 
-两种类型都保存本轮提取的全部列表候选，不按策略裁剪入库。只有 G2G 金币/游戏币的类型 1 读取店铺详情。
+两种类型都保存全局排除后剩余的全部列表候选，不按策略裁剪入库。只有 G2G 金币/游戏币的类型 1 读取店铺详情。
 
 - `enhance_stores` 为 `varchar(2048) NOT NULL DEFAULT ''`，支持多个名字按英文/中文逗号、换行等分隔；Python 兼容数组和 JSON 数组，将大小写、HTML 实体及空白归一化，对 seller_id 或 seller_name 完整匹配。
 - 非空名单直接选择本轮候选中命中的店铺，不查询或考虑改价策略、黑白名单、库存、好评率、价格门槛，也不限制三家。非空名单未命中时不加强，不回退自动 Top3，不向列表上限之外搜索。
@@ -76,6 +79,6 @@ rtk proxy bash -n run_crawl_and_consume.sh
 rtk git diff --check
 ```
 
-`test_other_offer_prices.py` 覆盖加强选择、异步价格归属和列表上限；`test_eldorado_limit.py` 覆盖独立 ELD 上限与第一页；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_interval.py` 用模拟时钟覆盖连续三轮 ELD 目标、抓取耗时与提前触发、等待/跳过边界、失败不推进时间及开始时间持久化；`test_crawl_workers.py` 覆盖分片、dotenv 进程数加载、环境变量覆盖、非法值拒绝、配置不执行、等锁成功/超时/错误及失败汇总，并以操作系统 flock 验证一轮运行、一个等待者、额外触发退出和两轮无重叠。
+`test_other_offer_prices.py` 覆盖加强选择、异步价格归属、列表上限与各 DOM 路径的全局排除；`test_eldorado_limit.py` 覆盖独立 ELD 上限、第一页、价格解析前排除及全部排除时不回退 DOM；`test_crawl_excluded_stores.py` 覆盖多名字/ID 归一化完整匹配、空配置、默认与加强类型在价格处理前排除、剩余候选入库及通知条数；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_interval.py` 用模拟时钟覆盖连续三轮 ELD 目标、抓取耗时与提前触发、等待/跳过边界、失败不推进时间及开始时间持久化；`test_crawl_workers.py` 覆盖分片、dotenv 进程数加载、环境变量覆盖、非法值拒绝、配置不执行、等锁成功/超时/错误及失败汇总，并以操作系统 flock 验证一轮运行、一个等待者、额外触发退出和两轮无重叠。
 
 每次相关改动完成后按根目录 AGENTS.md 对照最终源码更新本 skill；独立工具变化另同步既有 CodeBuddy skill。替换过时约定，不写改动流水账、凭证或未经验证的部署状态。

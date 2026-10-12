@@ -41,6 +41,23 @@ CURRENCY_SYMBOL_MAP = {
 }
 
 
+def store_is_excluded(seller_id, seller_name, excluded_stores):
+    return bool(excluded_stores & identifiers([seller_id, seller_name]))
+
+
+def filter_excluded_stores(items):
+    """先排除配置中的店铺，不对它们处理报价或选择详情加强。"""
+    excluded_stores = identifiers(config.CRAWL_EXCLUDE_STORES)
+    if not excluded_stores:
+        return items
+    remaining = [item for item in items if not store_is_excluded(
+        item.get("seller_id"), item.get("seller_name"), excluded_stores
+    )]
+    if len(remaining) < len(items):
+        print(f"  -> 全局排除店铺: 跳过 {len(items) - len(remaining)} 条")
+    return remaining
+
+
 def parse_currency_from_price(price_text: str) -> tuple[str | None, str | None]:
     """
     从价格文本中解析货币符号和纯数字价格
@@ -253,7 +270,7 @@ async def scrape_page(page, url: str) -> list:
 
     # ========== Python 侧货币解析：优先从页面实际内容提取 ==========
     items = []
-    for raw in items_raw:
+    for raw in filter_excluded_stores(items_raw):
         item = {k: v for k, v in raw.items()}
 
         price_raw = raw.get("price_raw", "")
@@ -559,7 +576,7 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enh
         "USD", "SGD", "EUR", "GBP", "AUD", "CAD", "JPY", "CNY", "HKD",
         "MYR", "KRW", "INR", "THB", "PHP", "IDR", "CHF", "NZD", "BRL",
     }
-    for raw in items_raw:
+    for raw in filter_excluded_stores(items_raw):
         item = dict(raw)
         price_raw = raw.get("unit_price_raw", "")
         currency_label = raw.get("currency_label", "").strip().upper()
@@ -682,9 +699,16 @@ async def scrape_eldorado_page(page, url: str) -> list:
         if api_response is not None and api_response.ok:
             payload = await api_response.json()
             api_items = []
+            excluded_stores = identifiers(config.CRAWL_EXCLUDE_STORES)
+            excluded_count = 0
             for record in payload.get("results", [])[:offer_limit]:
                 offer = record.get("offer") or {}
                 user = record.get("user") or {}
+                username = str(user.get("username") or "").strip()
+                seller_id = user.get("id") or offer.get("userId") or username
+                if store_is_excluded(seller_id, username, excluded_stores):
+                    excluded_count += 1
+                    continue
                 order_info = record.get("userOrderInfo") or {}
                 delivery = record.get("deliveryTime") or {}
 
@@ -708,7 +732,6 @@ async def scrape_eldorado_page(page, url: str) -> list:
                     else:
                         price_info = {}
                 unit = unit_label(offer.get("unitSystem"))
-                username = str(user.get("username") or "").strip()
                 offer_id = str(offer.get("id") or "").strip()
                 game_alias = str(offer.get("gameSeoAlias") or "").strip()
 
@@ -748,7 +771,7 @@ async def scrape_eldorado_page(page, url: str) -> list:
                 min_quantity = offer.get("minQuantity")
 
                 api_items.append({
-                    "seller_id": user.get("id") or offer.get("userId") or username,
+                    "seller_id": seller_id,
                     "seller_name": username or None,
                     "seller_level": "Verified" if user.get("isVerifiedSeller") else None,
                     "seller_url": seller_url,
@@ -770,7 +793,9 @@ async def scrape_eldorado_page(page, url: str) -> list:
                     "platform": "eldorado",
                 })
 
-            if api_items:
+            if excluded_count:
+                print(f"  -> 全局排除店铺: 跳过 {excluded_count} 条")
+            if api_items or excluded_count:
                 print(
                     f"  -> Eldorado API 返回 {len(api_items)} 条 "
                     f"(价格使用 USD: {sum(i.get('currency') == 'USD' for i in api_items)} 条)"
@@ -912,7 +937,7 @@ async def scrape_eldorado_page(page, url: str) -> list:
     """, offer_limit)
 
     items = []
-    for raw in items_raw:
+    for raw in filter_excluded_stores(items_raw):
         item = dict(raw)
         item.pop("_debug", None)
 

@@ -85,10 +85,11 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
                 container.append(card);
             }
         }""")
-        for refresh in (False, True):
-            with self.subTest(refresh=refresh), \
+        for refresh, excluded in ((False, ""), (True, ""), (False, "seller0,seller3"), (True, "seller0,seller3")):
+            with self.subTest(refresh=refresh, excluded=excluded), \
                  patch.object(self.page, "goto", new=AsyncMock()), \
                  patch.object(crawl_from_db.config, "CRAWL_OFFER_LIMIT", 10), \
+                 patch.object(crawl_from_db.config, "CRAWL_EXCLUDE_STORES", excluded), \
                  patch.object(crawl_from_db, "asyncio", SimpleNamespace(sleep=AsyncMock())) as async_stub, \
                  patch.object(crawl_from_db, "refresh_other_offer_prices", new=AsyncMock()) as detail:
                 rows = await crawl_from_db.scrape_other_offer_page(
@@ -99,10 +100,10 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     detail.assert_not_awaited()
                 self.assertEqual([row["seller_id"] for row in rows],
-                                 [f"seller{i}" for i in range(10)])
+                                 [f"seller{i}" for i in range(10) if not excluded or i not in (0, 3)])
                 async_stub.sleep.assert_not_awaited()
 
-    async def test_generic_g2g_cards_also_only_keep_first_eight(self):
+    async def test_generic_g2g_cards_exclude_shops_within_first_eight(self):
         await self.page.evaluate("""() => {
             for (let i = 0; i < 20; i++) {
                 const card = document.createElement('div');
@@ -114,14 +115,15 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
         html = await self.page.content()
         await self.page.route("http://fixture.test/**", lambda route: route.fulfill(body=html, content_type="text/html"))
         with patch.object(crawl_from_db.config, "CRAWL_OFFER_LIMIT", 8), \
+             patch.object(crawl_from_db.config, "CRAWL_EXCLUDE_STORES", "itemSeller0,itemSeller3"), \
              patch.object(crawl_from_db, "asyncio", SimpleNamespace(sleep=AsyncMock())), \
              patch.object(self.page, "evaluate", wraps=self.page.evaluate) as evaluate:
             rows = await crawl_from_db.scrape_page(self.page, "http://fixture.test/")
-            self.assertEqual(len(rows), 8)
-            self.assertEqual([row["seller_id"] for row in rows], [f"itemSeller{i}" for i in range(8)])
+            self.assertEqual(len(rows), 6)
+            self.assertEqual([row["seller_id"] for row in rows], [f"itemSeller{i}" for i in (1, 2, 4, 5, 6, 7)])
             self.assertFalse(any("scrollTo" in call.args[0] for call in evaluate.await_args_list))
 
-    async def test_eldorado_dom_only_keeps_first_eight_without_scroll_or_pagination(self):
+    async def test_eldorado_dom_excludes_shops_within_first_eight_without_pagination(self):
         await self.page.evaluate("""() => {
             const container = document.createElement('div');
             container.id = 'other-sellers';
@@ -135,10 +137,11 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
             document.body.append(container);
         }""")
         with patch.object(self.page, "goto", new=AsyncMock()), \
+             patch.object(crawl_from_db.config, "CRAWL_EXCLUDE_STORES", "eld0,eld3"), \
              patch.object(crawl_from_db, "asyncio", SimpleNamespace(sleep=AsyncMock())), \
              patch.object(self.page, "evaluate", wraps=self.page.evaluate) as evaluate:
             rows = await crawl_from_db.scrape_eldorado_page(self.page, "https://www.eldorado.gg/fixture")
-            self.assertEqual([row["seller_id"] for row in rows], [f"eld{i}" for i in range(8)])
+            self.assertEqual([row["seller_id"] for row in rows], [f"eld{i}" for i in (1, 2, 4, 5, 6, 7)])
             self.assertFalse(any("scrollTo" in call.args[0] for call in evaluate.await_args_list))
 
     async def test_stale_portal_for_new_seller_times_out_instead_of_using_old_price(self):
