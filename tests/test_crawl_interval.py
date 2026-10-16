@@ -60,7 +60,7 @@ class CrawlIntervalTests(unittest.TestCase):
             save = stack.enter_context(patch.object(db, "save_crawl_data", return_value=0))
             stack.enter_context(patch.object(db, "update_last_crawl", side_effect=stored.__setitem__))
             notify = stack.enter_context(patch.object(db, "insert_crawl_notify"))
-            stack.enter_context(patch.object(crawl_from_db, "scrape_eldorado_api", side_effect=scrape))
+            stack.enter_context(patch.object(crawl_from_db, "scrape_eldorado_dom", side_effect=scrape))
             stack.enter_context(patch.object(crawl_from_db, "scrape_page", side_effect=scrape))
             self.assertEqual(asyncio.run(crawl_from_db.run()), 0)
         order = [target_id for target_id, _ in starts]
@@ -154,7 +154,7 @@ class CrawlIntervalTests(unittest.TestCase):
             save = stack.enter_context(patch.object(db, "save_crawl_data", return_value=8))
             update = stack.enter_context(patch.object(db, "update_last_crawl", side_effect=stored.__setitem__))
             notify = stack.enter_context(patch.object(db, "insert_crawl_notify"))
-            stack.enter_context(patch.object(crawl_from_db, "scrape_eldorado_api", side_effect=scrape))
+            stack.enter_context(patch.object(crawl_from_db, "scrape_eldorado_dom", side_effect=scrape))
 
             for round_start in (0, 29, 60):
                 self.now = self.base + round_start
@@ -210,14 +210,14 @@ class CrawlIntervalTests(unittest.TestCase):
              patch.object(db, "save_crawl_data") as save, \
              patch.object(db, "update_last_crawl") as update, \
              patch.object(db, "insert_crawl_notify") as notify, \
-             patch.object(crawl_from_db, "scrape_eldorado_api", side_effect=RuntimeError("fetch failed")), \
+             patch.object(crawl_from_db, "scrape_eldorado_dom", side_effect=RuntimeError("fetch failed")), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(asyncio.run(crawl_from_db.run()), 1)
             save.assert_not_called()
             update.assert_not_called()
             notify.assert_not_called()
-            self.request.dispose.assert_awaited_once()
-            self.browser.close.assert_not_awaited()
+            self.context.close.assert_awaited_once()
+            self.browser.close.assert_awaited_once()
 
     def test_database_writes_provided_start_timestamp(self):
         connection = MagicMock()

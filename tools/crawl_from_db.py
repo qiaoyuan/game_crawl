@@ -670,231 +670,17 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enh
     return items
 
 
-async def scrape_eldorado_api(request, url: str) -> list | None:
-    """直接请求 offers API；None 表示需要 DOM 兜底，空列表是有效结果。"""
-    from urllib.parse import parse_qs, quote, urlencode, urlparse
-
-    offer_limit = config.ELD_OFFER_PAGE_SIZE
-
-    print(f"  [*] 打开 Eldorado 页面: {url}")
-
-    # 从商品页 URL 构造官方 offers API。
-    # 路径两种形式：/g/132-0-0（132=gameId，0=Currency）和 /g/220（只有 gameId）。
-    # te_v0 对应 tradeEnvironmentValue0；其余未知 query 是属性筛选，需原样透传，
-    # 例如 path-of-exile-2-orbs=mirror-of-kalandra。
-    parsed_url = urlparse(url)
-    legacy_match = re.search(r"/g/(\d+)(?:-(\d+)-(\d+))?", parsed_url.path)
-    api_response = None
-    if legacy_match:
-        category_map = {"0": "Currency", "1": "Account", "2": "CustomItem"}
-        query = parse_qs(parsed_url.query)
-        params = [
-            ("gameId", legacy_match.group(1)),
-            ("category", category_map.get(legacy_match.group(2) or "0", "Currency")),
-        ]
-        # 属性筛选透传，排序单独设置；分页参数不透传，固定第一页，条数由 ELD_OFFER_PAGE_SIZE 控制。
-        # 否则会抓成该游戏的全量报价而不是当前筛选的道具。
-        passthrough = []
-        for key, values in sorted(query.items()):
-            if not values:
-                continue
-            env_match = re.fullmatch(r"te_v(\d+)", key)
-            if env_match:
-                params.append((f"tradeEnvironmentValue{env_match.group(1)}", values[0]))
-            elif key not in {"offerSortingCriterion", "pageIndex", "pageSize", "page", "page_size"}:
-                passthrough.append((key, values[0]))
-        params.extend([
-            ("pageIndex", "1"),
-            ("pageSize", str(offer_limit)),
-            ("offerSortingCriterion", query.get("offerSortingCriterion", ["Cheapest"])[0]),
-        ])
-        params.extend(passthrough)
-        api_url = (
-            "https://www.eldorado.gg/api/predefinedOffers/augmentedGame/offers?"
-            + urlencode(params)
-        )
-        try:
-            api_response = await request.get(
-                api_url,
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": url,
-                },
-                timeout=60000,
-            )
-            print(f"  -> Eldorado API 状态: {api_response.status}")
-        except Exception as e:
-            print(f"  [!] Eldorado API 直连失败: {e}")
-    else:
-        print("  [!] 无法从 URL 解析 Eldorado gameId，回退 DOM 解析")
-
-    def format_duration(value: str | None) -> str | None:
-        """将 API 的 TimeSpan 转成页面显示格式，如 00:06:28 -> 6 min。"""
-        if not value:
-            return None
-        try:
-            first, minutes, _seconds = value.split(":", 2)
-            if "." in first:
-                days_text, hours_text = first.split(".", 1)
-                days = int(days_text)
-                hours = int(hours_text)
-            else:
-                days = 0
-                hours = int(first)
-            if days:
-                return f"{days} d"
-            if hours:
-                return f"{hours} h"
-            return f"{max(1, int(minutes))} min"
-        except (TypeError, ValueError):
-            return str(value)
-
-    def guaranteed_delivery_text(value: str | None) -> str | None:
-        if not value:
-            return None
-        match = re.match(r"^(Minute|Hour|Day)(\d+)$", value)
-        if not match:
-            return value
-        unit = {"Minute": "min", "Hour": "h", "Day": "d"}[match.group(1)]
-        return f"{match.group(2)} {unit}"
-
-    def unit_label(unit_system: str | None) -> str:
-        return {
-            "Unit1": "",
-            "Unit1000": "K",
-            "Unit1000000": "M",
-            "Unit1000000000": "B",
-        }.get(unit_system or "", "")
-
-    try:
-        if api_response is not None and api_response.ok:
-            payload = await api_response.json()
-            api_items = []
-            excluded_stores = identifiers(config.CRAWL_EXCLUDE_STORES)
-            excluded_count = 0
-            for record in payload.get("results", [])[:offer_limit]:
-                offer = record.get("offer") or {}
-                user = record.get("user") or {}
-                username = str(user.get("username") or "").strip()
-                seller_id = user.get("id") or offer.get("userId") or username
-                if store_is_excluded(seller_id, username, excluded_stores):
-                    excluded_count += 1
-                    continue
-                order_info = record.get("userOrderInfo") or {}
-                delivery = record.get("deliveryTime") or {}
-
-                # 价格统一按 USD 入库。优先用接口的 pricePerUnitInUSD；
-                # 若缺失则用 exchangeRate（该字段是「1 USD = N 展示货币」）换算回 USD。
-                price_info = offer.get("pricePerUnitInUSD") or {}
-                if price_info.get("amount") is None:
-                    local_price = offer.get("pricePerUnit") or {}
-                    local_amount = local_price.get("amount")
-                    rate = (offer.get("exchangeRate") or {}).get("exchangeRate")
-                    if local_amount is not None and str(local_price.get("currency")) == "USD":
-                        price_info = {"amount": local_amount, "currency": "USD"}
-                    elif local_amount is not None and rate:
-                        try:
-                            price_info = {
-                                "amount": round(float(local_amount) / float(rate), 8),
-                                "currency": "USD",
-                            }
-                        except (TypeError, ValueError, ZeroDivisionError):
-                            price_info = {}
-                    else:
-                        price_info = {}
-                unit = unit_label(offer.get("unitSystem"))
-                offer_id = str(offer.get("id") or "").strip()
-                game_alias = str(offer.get("gameSeoAlias") or "").strip()
-
-                median_text = format_duration(delivery.get("deliveryTimeMedian"))
-                expected_text = format_duration(delivery.get("expectedTime"))
-                if median_text and expected_text and median_text != expected_text:
-                    delivery_text = f"{median_text} - {expected_text}"
-                else:
-                    delivery_text = (
-                        median_text
-                        or expected_text
-                        or guaranteed_delivery_text(offer.get("guaranteedDeliveryTime"))
-                    )
-
-                trade_values = offer.get("tradeEnvironmentValues") or []
-                trade_name = " / ".join(
-                    str(value.get("value"))
-                    for value in trade_values
-                    if value.get("value")
-                )
-                title_parts = [offer.get("gameCategoryTitle"), trade_name]
-
-                score = order_info.get("feedbackScore")
-                try:
-                    rating = f"{float(score):.2f}" if score is not None else None
-                except (TypeError, ValueError):
-                    rating = None
-
-                seller_url = (
-                    f"https://www.eldorado.gg/users/{quote(username, safe='')}/shop/Currency"
-                    if username else None
-                )
-                offer_url = (
-                    f"https://www.eldorado.gg/{game_alias}/og/{offer_id}"
-                    if game_alias and offer_id else url
-                )
-                min_quantity = offer.get("minQuantity")
-
-                api_items.append({
-                    "seller_id": seller_id,
-                    "seller_name": username or None,
-                    "seller_level": "Verified" if user.get("isVerifiedSeller") else None,
-                    "seller_url": seller_url,
-                    "is_online": False,
-                    "product_title": " - ".join(str(v) for v in title_parts if v),
-                    "offer_url": offer_url,
-                    "stock": str(offer.get("quantity")) if offer.get("quantity") is not None else None,
-                    "price": str(price_info.get("amount")) if price_info.get("amount") is not None else None,
-                    "currency": "USD",
-                    "min_order": (
-                        f"{min_quantity} {unit}".strip()
-                        if min_quantity is not None else None
-                    ),
-                    "delivery_time": delivery_text,
-                    "rating": rating,
-                    "unit": unit,
-                    "review_count": order_info.get("ratingCount"),
-                    "offer_id": offer_id or None,
-                    "platform": "eldorado",
-                })
-
-            if excluded_count:
-                print(f"  -> 全局排除店铺: 跳过 {excluded_count} 条")
-            if api_items or excluded_count:
-                print(
-                    f"  -> Eldorado API 返回 {len(api_items)} 条 "
-                    f"(价格使用 USD: {sum(i.get('currency') == 'USD' for i in api_items)} 条)"
-                )
-                return api_items
-    except Exception as e:
-        print(f"  [!] Eldorado API 数据解析失败，回退 DOM 解析: {e}")
-    finally:
-        if api_response is not None:
-            await api_response.dispose()
-
-    return None
-
-
 async def scrape_eldorado_page(page, url: str) -> list:
-    """兼容已有页面调用，生产入口可直接请求 API 而不创建页面。"""
-    items = await scrape_eldorado_api(page.request, url)
-    if items is not None:
-        return items
+    """按页面实际展示顺序读取 ELD 前 N 条，不使用接口顺序或自行排序。"""
     return await scrape_eldorado_dom(page, url)
 
 
 async def scrape_eldorado_dom(page, url: str) -> list:
-    """API 不可用时才加载 Eldorado 页面。"""
+    """直接读取网页 #other-sellers 中的前 N 条，保留页面顺序。"""
     offer_limit = config.ELD_OFFER_PAGE_SIZE
 
-    # API 不可用时再加载页面，解析 #other-sellers 下的 .offer-row。
+    print(f"  [*] 打开 Eldorado 页面，按页面顺序取前 {offer_limit} 条: {url}")
+    # 排序由网站自身处理；不修改目标 URL，不点击排序，不翻页或滚动补抓。
     await page.set_extra_http_headers({
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -1152,7 +938,7 @@ ELDORADO_COOKIES = [
 
 
 class CrawlSession:
-    """每个 worker 按需创建并复用请求/浏览器，退出时统一释放。"""
+    """每个 worker 按需创建并复用浏览器，退出时统一释放。"""
 
     def __init__(self):
         self.resources = AsyncExitStack()
@@ -1161,7 +947,6 @@ class CrawlSession:
         self.g2g_context = None
         self.page = None
         self.browser_cleanup_pending = False
-        self.eldorado_request = None
 
     async def __aenter__(self):
         await self.resources.__aenter__()
@@ -1171,7 +956,7 @@ class CrawlSession:
         try:
             await self._close_browser()
         finally:
-            # 即使关闭期间被取消，也继续释放 request / Playwright driver。
+            # 即使关闭期间被取消，也继续释放 Playwright driver。
             result = await self.resources.__aexit__(*args)
         return result
 
@@ -1264,20 +1049,7 @@ class CrawlSession:
                 await self._close_browser()
 
     async def scrape_eldorado(self, url):
-        if self.eldorado_request is None:
-            playwright = await self.get_playwright()
-            self.eldorado_request = await playwright.request.new_context(
-                user_agent=ELDORADO_USER_AGENT,
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-                storage_state={"cookies": ELDORADO_COOKIES, "origins": []},
-            )
-            self.resources.push_async_callback(self.eldorado_request.dispose)
-            print("  -> ELD API 请求模式（成功时不启动 Chromium）")
-        items = await scrape_eldorado_api(self.eldorado_request, url)
-        if items is not None:
-            return items
-
-        browser = await self.get_browser("ELD API 不可用，DOM 兜底")
+        browser = await self.get_browser("ELD 按页面顺序抓取")
         context = await browser.new_context(
             viewport=config.VIEWPORT,
             user_agent=ELDORADO_USER_AGENT,
@@ -1286,7 +1058,7 @@ class CrawlSession:
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
         try:
-            # 每个 DOM 兜底目标使用独立 context，不带 G2G cookie。
+            # 每个 ELD 目标使用独立 context，不带 G2G cookie。
             await context.add_cookies(ELDORADO_COOKIES)
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });

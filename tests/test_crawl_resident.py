@@ -320,24 +320,32 @@ class CrawlResidentTests(unittest.TestCase):
         self.assertEqual(queries[:3], [0, 5, 35])
         self.assertEqual(self.starts, [(24, 0), (26, 35), (26, 65)])
 
-    def test_api_session_reuses_driver_and_request_and_closes_after_window(self):
-        request, playwright, manager = MagicMock(), MagicMock(), MagicMock()
-        request.dispose = AsyncMock()
-        playwright.request.new_context = AsyncMock(return_value=request)
-        playwright.chromium.launch = AsyncMock()
+    def test_page_session_reuses_browser_and_closes_contexts_after_each_target(self):
+        playwright, manager, browser = MagicMock(), MagicMock(), MagicMock()
+        contexts = [MagicMock() for _ in range(3)]
+        for context in contexts:
+            context.add_cookies = AsyncMock()
+            context.add_init_script = AsyncMock()
+            context.new_page = AsyncMock(return_value=MagicMock())
+            context.close = AsyncMock()
+        browser.new_context = AsyncMock(side_effect=contexts)
+        browser.close = AsyncMock()
+        browser.is_connected.return_value = True
+        playwright.request.new_context = AsyncMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
         manager.__aenter__ = AsyncMock(return_value=playwright)
         manager.__aexit__ = AsyncMock()
         saved_starts = []
 
         async def scrape(current, url):
-            self.assertIs(current, request)
+            self.assertIs(current, contexts[len(self.starts)].new_page.return_value)
             self.starts.append((24, self.clock.elapsed))
             self.clock.elapsed += 1
             return [{"seller_id": "store", "price": "1", "currency": "USD"}]
 
         with self.environment(lambda *_: [self.target(24)]):
             with patch.object(crawl_from_db, "async_playwright", return_value=manager) as driver, \
-                 patch.object(crawl_from_db, "scrape_eldorado_api", side_effect=scrape), \
+                 patch.object(crawl_from_db, "scrape_eldorado_dom", side_effect=scrape), \
                  patch.object(db, "increment_version", side_effect=[1, 2, 3]), \
                  patch.object(db, "save_crawl_data", return_value=1) as save, \
                  patch.object(db, "update_last_crawl", side_effect=lambda tid, at: saved_starts.append(at)), \
@@ -350,9 +358,11 @@ class CrawlResidentTests(unittest.TestCase):
         self.assertEqual([call.args for call in notify.call_args_list],
                          [(24, 1, 1), (24, 2, 1), (24, 3, 1)])
         driver.assert_called_once_with()
-        playwright.request.new_context.assert_awaited_once()
-        playwright.chromium.launch.assert_not_awaited()
-        request.dispose.assert_awaited_once()
+        playwright.request.new_context.assert_not_awaited()
+        playwright.chromium.launch.assert_awaited_once()
+        for context in contexts:
+            context.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
         manager.__aexit__.assert_awaited_once()
 
 
