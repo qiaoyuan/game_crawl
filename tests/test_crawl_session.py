@@ -112,14 +112,16 @@ class CrawlSessionTests(unittest.IsolatedAsyncioTestCase):
         targets = [{"id": i + 1, "game_product_id": 1, "category": "ELD游戏币", "crawl_type": i,
                     "url": "https://www.eldorado.gg/currency/g/220?offerSortingCriterion=MostPopular"}
                    for i in (0, 1)]
-        offers = list(reversed(records()))
-        for record in offers:
-            record["offer"]["quantity"] = 1
+        offers = [{"offer": {"id": str(i), "quantity": 1,
+                             "pricePerUnitInUSD": {"amount": 150 - i, "currency": "USD"},
+                             "pricePerUnit": {"amount": i + 1, "currency": "SGD"}},
+                   "user": {"username": f"seller{i}"}} for i in range(150)]
+        offers[-1]["user"]["username"] = "own_shop"
         self.request.get.side_effect = [api_response(records=offers) for _ in targets]
         with contextlib.ExitStack() as stack:
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             stack.enter_context(patch.object(crawl_from_db, "async_playwright", return_value=self.manager))
-            stack.enter_context(patch.object(config, "CRAWL_EXCLUDE_STORES", ""))
+            stack.enter_context(patch.object(config, "CRAWL_EXCLUDE_STORES", "own_shop"))
             stack.enter_context(patch.object(db, "get_pending_targets", return_value=targets))
             policies = stack.enter_context(patch.object(db, "get_crawl_strategies"))
             stack.enter_context(patch.object(db, "increment_version", return_value=9))
@@ -130,7 +132,9 @@ class CrawlSessionTests(unittest.IsolatedAsyncioTestCase):
         policies.assert_not_called()
         self.assertEqual(save.call_count, 2)
         for call in save.call_args_list:
-            self.assertEqual([row["price"] for row in call.args[2]], [str(i) for i in range(1, 9)])
+            self.assertEqual([row["price"] for row in call.args[2]], [str(i) for i in range(2, 10)])
+            self.assertEqual([row["seller_name"] for row in call.args[2]],
+                             [f"seller{i}" for i in range(148, 140, -1)])
             self.assertTrue(all(row["stock"] == "1" for row in call.args[2]))
         self.assertEqual([call.args for call in notify.call_args_list], [(1, 9, 8), (2, 9, 8)])
         self.playwright.chromium.launch.assert_not_awaited()
@@ -455,7 +459,7 @@ class StandaloneRequestTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"User-Agent: {crawl_from_db.ELDORADO_USER_AGENT}".lower(), headers.lower())
             params = parse_qs(urlparse(headers.splitlines()[0].split()[1]).query)
             self.assertEqual(params["pageIndex"], ["1"])
-            self.assertEqual(params["pageSize"], ["8"])
+            self.assertEqual(params["pageSize"], ["150"])
 
 
 if __name__ == "__main__":

@@ -7,27 +7,30 @@ from g2g import config
 
 
 class EldoradoFirstPageTests(unittest.IsolatedAsyncioTestCase):
-    async def test_api_only_requests_first_eight_and_preserves_product_filters(self):
+    async def test_api_requests_150_then_selects_lowest_eight(self):
         page = MagicMock()
-        records = [{"offer": {"id": str(i), "pricePerUnitInUSD": {"amount": i + 1}},
-                    "user": {"username": f"seller{i}"}} for i in range(20)]
+        records = [{"offer": {"id": str(i), "pricePerUnitInUSD": {"amount": 150 - i}},
+                    "user": {"username": f"seller{i}"}} for i in range(150)]
+        records.append({"offer": {"pricePerUnitInUSD": {"amount": "0.5"}},
+                        "user": {"username": "outside_batch"}})
         response = MagicMock(ok=True, status=200)
         response.dispose = AsyncMock()
         response.json = AsyncMock(return_value={"results": records})
         page.request.get = AsyncMock(return_value=response)
         url = ("https://www.eldorado.gg/poe-2-currency/g/220?"
                "path-of-exile-2-orbs=mirror-of-kalandra&te_v0=Forbidden%20Rites%20Standard"
-               "&offerSortingCriterion=MostPopular&pageIndex=2&pageSize=150")
+               "&offerSortingCriterion=MostPopular&pageIndex=2&pageSize=8")
         with patch.object(config, "ELD_OFFER_PAGE_SIZE", 8):
             rows = await scrape_eldorado_page(page, url)
         page.request.get.assert_awaited_once()
         params = parse_qs(urlparse(page.request.get.await_args.args[0]).query)
         self.assertEqual(params["pageIndex"], ["1"])
-        self.assertEqual(params["pageSize"], ["8"])
+        self.assertEqual(params["pageSize"], ["150"])
         self.assertEqual(params["path-of-exile-2-orbs"], ["mirror-of-kalandra"])
         self.assertEqual(params["tradeEnvironmentValue0"], ["Forbidden Rites Standard"])
         self.assertEqual(params["offerSortingCriterion"], ["Cheapest"])
-        self.assertEqual([row["seller_name"] for row in rows], [f"seller{i}" for i in range(8)])
+        self.assertEqual([row["seller_name"] for row in rows], [f"seller{i}" for i in range(149, 141, -1)])
+        self.assertEqual([row["price"] for row in rows], [str(i) for i in range(1, 9)])
         page.goto.assert_not_called()
         response.dispose.assert_awaited_once()
 
@@ -43,10 +46,10 @@ class EldoradoFirstPageTests(unittest.IsolatedAsyncioTestCase):
             rows = await scrape_eldorado_page(page, "https://www.eldorado.gg/currency/g/220")
         self.assertEqual(len(rows), 5)
         params = parse_qs(urlparse(page.request.get.await_args.args[0]).query)
-        self.assertEqual(params["pageSize"], ["5"])
+        self.assertEqual(params["pageSize"], ["150"])
         self.assertEqual(params["pageIndex"], ["1"])
 
-    async def test_excludes_api_shops_before_parsing_prices_without_refilling(self):
+    async def test_excludes_before_parsing_then_selects_eight_from_remaining_batch(self):
         page = MagicMock()
         records = [{"offer": {"id": str(i), "pricePerUnitInUSD": {"amount": i + 1}},
                     "user": {"username": f"seller{i}"}} for i in range(20)]
@@ -62,7 +65,8 @@ class EldoradoFirstPageTests(unittest.IsolatedAsyncioTestCase):
              patch.object(config, "ELD_OFFER_PAGE_SIZE", 8):
             rows = await scrape_eldorado_page(page, "https://www.eldorado.gg/currency/g/220")
         self.assertEqual([row["seller_name"] for row in rows],
-                         [f"seller{i}" for i in (1, 3, 4, 5, 6, 7)])
+                         [f"seller{i}" for i in (1, 3, 4, 5, 6, 7, 8, 9)])
+        page.request.get.assert_awaited_once()
         page.goto.assert_not_called()
 
     async def test_api_all_excluded_returns_zero_without_dom_fallback(self):
@@ -116,6 +120,27 @@ class EldoradoFirstPageTests(unittest.IsolatedAsyncioTestCase):
             rows = await scrape_eldorado_page(page, "https://www.eldorado.gg/currency/g/220")
         self.assertEqual([row["seller_name"] for row in rows], ["usd_fallback", "euro", "usd"])
         self.assertEqual(rows[1]["price"], "1.5E-9")
+        page.goto.assert_not_called()
+
+    async def test_usd_amount_controls_selection_not_display_currency(self):
+        page = MagicMock()
+        prices = ["10", "2", "9", "8", "7", "6", "5", "4", "3", "1"]
+        records = [{"offer": {
+            "id": str(i), "pricePerUnitInUSD": {"amount": usd, "currency": "USD"},
+            "pricePerUnit": {"amount": i + 1, "currency": "SGD"}},
+            "user": {"username": f"seller{i}"}}
+            for i, usd in enumerate(prices)]
+        response = MagicMock(ok=True, status=200)
+        response.dispose = AsyncMock()
+        response.json = AsyncMock(return_value={"pageIndex": 1, "pageSize": 150,
+                                                "recordCount": 10, "results": records})
+        page.request.get = AsyncMock(return_value=response)
+        with patch.object(config, "CRAWL_EXCLUDE_STORES", ""), patch.object(config, "ELD_OFFER_PAGE_SIZE", 8):
+            rows = await scrape_eldorado_page(page, "https://www.eldorado.gg/currency/g/220")
+        self.assertEqual([row["seller_name"] for row in rows],
+                         [f"seller{i}" for i in (9, 1, 8, 7, 6, 5, 4, 3)])
+        self.assertEqual([row["price"] for row in rows], [str(i) for i in range(1, 9)])
+        page.request.get.assert_awaited_once()
         page.goto.assert_not_called()
 
 

@@ -53,7 +53,8 @@ CRAWL_OFFER_LIMIT = int(os.environ.get("CRAWL_OFFER_LIMIT", "10"))
 if CRAWL_OFFER_LIMIT < 1:
     raise ValueError("CRAWL_OFFER_LIMIT 必须为正整数")
 
-# Eldorado API 最低价第一页前 N 条，默认 8 条；按 USD 单价升序，DOM 兜底同样适用。
+# Eldorado 保存上限，默认 8 条；API 固定请求 150 条，排除配置店铺后按 USD 单价排序截取。
+# DOM 兜底仍只读取页面前 N 条。
 ELD_OFFER_PAGE_SIZE = int(os.environ.get("ELD_OFFER_PAGE_SIZE", "8"))
 if ELD_OFFER_PAGE_SIZE < 1:
     raise ValueError("ELD_OFFER_PAGE_SIZE 必须为正整数")
