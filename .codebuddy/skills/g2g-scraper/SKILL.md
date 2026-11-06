@@ -25,6 +25,7 @@ g2g/
 │   ├── scrape_g2g_products.py  # 爬取 G2G 产品卡片（无需登录，输出 JSON）
 │   ├── scrape_category.py      # 爬取 G2G 分类页商户（无需登录）
 │   ├── scrape_eldorado.py      # 爬取 Eldorado.gg 商户（无需登录）
+│   ├── monitor_eldorado.py     # 连接已开启 CDP 的浏览器，监控当前订单详情及聊天
 │   ├── export_offers.py        # 导出 Offers（需登录）
 │   └── scrape_seller.py        # 爬取商户数据（需登录）
 ├── downloads/                  # 输出目录
@@ -61,6 +62,13 @@ python -m tools.scrape_category "https://www.g2g.com/cn/categories/..."
 python -m tools.scrape_eldorado "https://www.eldorado.gg/..."
 ```
 
+### 监控 Eldorado 订单详情与聊天
+```bash
+mkdir -p downloads
+python -m tools.monitor_eldorado --chrome-auto-connect --output downloads/eldorado_orders.jsonl
+```
+先在已启用远程调试的 Chrome 中人工登录并打开订单详情。`--chrome-auto-connect` 通过 macOS Chrome 的 DevToolsActivePort 发现已有浏览器，连接时按提示允许；也可通过 `--cdp-url` 指定其他 Chromium 调试地址。每 3 秒读取首个匹配的 `/order/` 页面，可通过 `--interval` 和 CSS 选择器参数调整。程序不自动点击、刷新或遍历订单，首次读取和内容变化时向终端输出 JSON Lines，可选文件追加保存。聊天位于 TalkJS iframe，提取可见消息文本、绝对时间、方向及附件名称；结构不匹配时回退到可见文本。页面结构变化、虚拟滚动或尚未加载的内容可能影响结果。文件及终端输出含订单和对话信息，按敏感数据保管。
+
 ### 导出 Offers（需登录会话）
 ```bash
 python main.py export
@@ -74,7 +82,7 @@ python main.py reset    # 清除会话
 
 ## 关键注意事项
 
-- **输出格式**: 仅 JSON，保存到 `downloads/` 目录
+- **输出格式**: 抓取工具输出 JSON；订单监控输出 JSON Lines 到终端，可选追加到文件
 - **会话持久化**: `session.json` 保存登录态，后续运行无需重新登录
 - **OTP 验证**: 登录时需邮箱 OTP，脚本提示用户手动输入
 - **限流**: G2G 有请求频率限制，避免短时间内多次登录
