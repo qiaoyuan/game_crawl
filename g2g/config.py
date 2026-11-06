@@ -44,8 +44,8 @@ DB_NAME = os.environ.get("DB_NAME", "game_platform")
 
 # 每台爬虫只领取属于本机的任务；未配置时归属服务器 1。
 _crawl_server = os.environ.get("crawl_server", "1").strip()
-if _crawl_server not in ("1", "2"):
-    raise ValueError("crawl_server 必须为 1 或 2")
+if _crawl_server not in ("1", "2", "3"):
+    raise ValueError("crawl_server 必须为 1、2 或 3")
 CRAWL_SERVER = int(_crawl_server)
 
 # G2G 页面按当前展示顺序，仅抓取前 N 条竞品，默认 10 条（仅影响 G2G）。
