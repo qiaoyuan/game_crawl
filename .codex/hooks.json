@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c 'import json; print(json.dumps({\"hookSpecificOutput\": {\"hookEventName\": \"UserPromptSubmit\", \"additionalContext\": \"项目改动完成后，对照本次 diff 和最终源码核对并同步受影响的项目 skill；遵守用户只读或文档修改限制。不要把凭据或未经验证的线上状态写入 skill。纯格式或规范仍准确时说明已核对即可。\"}}, ensure_ascii=False))'",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

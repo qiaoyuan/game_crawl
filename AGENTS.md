@@ -23,4 +23,4 @@
 
 [.kiro/hooks/sync-crawl-skills.json](.kiro/hooks/sync-crawl-skills.json) 按 Kiro IDE 1.x / CLI V3 的 hook 格式配置 `PostFileCreate`、`PostFileSave`、`PostFileDelete`，在代理改动相关源码后提示同步 skill。匹配范围排除 skill、hook、AGENTS.md、日志、会话及虚拟环境，避免递归。
 
-这是 Kiro 的会话事件配置，不是后台文件监视器，也不是 Codex 或 CodeBuddy 的原生 hook。Codex 在本项目依照上面的“每次改动后同步 skill”规则维护；人工编辑、外部脚本或其他 IDE 的改动不能假定触发 Kiro hook，后续任务应结合 diff 补齐规范。
+这是 Kiro 的会话事件配置，不是后台文件监视器，也不是 CodeBuddy 的原生 hook。项目另有 `.codex/hooks.json`，在 Codex 收到用户请求时提醒核对并同步 skill；钩子需要 Codex 启用并信任后才运行，提醒不能替代最终源码检查。人工编辑、外部脚本或其他 IDE 的改动不能假定触发这些 hook，后续任务应结合 diff 补齐规范。
