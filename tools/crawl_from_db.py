@@ -671,6 +671,9 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enh
     return items
 
 
+ELD_API_FETCH_SIZE = 150
+
+
 def sort_eldorado_prices(items):
     """按真实 USD 单价数值稳定升序；无效报价不能当作最低价入库。"""
     def price_key(item):
@@ -718,7 +721,7 @@ async def scrape_eldorado_api(request, url: str) -> list | None:
             ("gameId", legacy_match.group(1)),
             ("category", category_map.get(legacy_match.group(2) or "0", "Currency")),
         ]
-        # 属性筛选透传，强制最低价排序；分页参数不透传，固定第一页，条数由 ELD_OFFER_PAGE_SIZE 控制。
+        # 属性筛选透传；固定请求第一页候选，保存条数单独控制。
         # 否则会抓成该游戏的全量报价而不是当前筛选的道具。
         passthrough = []
         for key, values in sorted(query.items()):
@@ -731,7 +734,7 @@ async def scrape_eldorado_api(request, url: str) -> list | None:
                 passthrough.append((key, values[0]))
         params.extend([
             ("pageIndex", "1"),
-            ("pageSize", str(offer_limit)),
+            ("pageSize", str(ELD_API_FETCH_SIZE)),
             ("offerSortingCriterion", "Cheapest"),
         ])
         params.extend(passthrough)
@@ -800,8 +803,9 @@ async def scrape_eldorado_api(request, url: str) -> list | None:
             api_items = []
             excluded_stores = identifiers(config.CRAWL_EXCLUDE_STORES)
             excluded_count = 0
-            # 最低价候选由 API 的 Cheapest 排序选出；限定范围后排除店铺，不向后补位。
-            for record in payload.get("results", [])[:offer_limit]:
+            # 先排除店铺，再从本批候选按 USD 单价选最低价。
+            candidates = payload.get("results", [])[:ELD_API_FETCH_SIZE]
+            for record in candidates:
                 offer = record.get("offer") or {}
                 user = record.get("user") or {}
                 username = str(user.get("username") or "").strip()
@@ -896,9 +900,10 @@ async def scrape_eldorado_api(request, url: str) -> list | None:
             if excluded_count:
                 print(f"  -> 全局排除店铺: 跳过 {excluded_count} 条")
             if api_items or excluded_count:
-                api_items = sort_eldorado_prices(api_items)
+                api_items = sort_eldorado_prices(api_items)[:offer_limit]
                 print(
-                    f"  -> Eldorado API 最低价第一页，按单价升序返回 {len(api_items)} 条 "
+                    f"  -> Eldorado API 第一页请求 {ELD_API_FETCH_SIZE} 条，候选 {len(candidates)} 条，"
+                    f"按单价升序返回 {len(api_items)} 条 "
                     f"(价格使用 USD: {sum(i.get('currency') == 'USD' for i in api_items)} 条)"
                 )
                 return api_items
