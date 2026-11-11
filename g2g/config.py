@@ -51,7 +51,7 @@ except ValueError:
 if CRAWL_SERVER < 1:
     raise ValueError("crawl_server 必须为正整数")
 
-# G2G 页面按当前展示顺序，仅抓取前 N 条竞品，默认 10 条（仅影响 G2G）。
+# G2G 游戏币仅取第一页 20 条，排除自家店铺后最多保存 min(配置值, 10) 条；其他分类取前 N 条。
 CRAWL_OFFER_LIMIT = int(os.environ.get("CRAWL_OFFER_LIMIT", "10"))
 if CRAWL_OFFER_LIMIT < 1:
     raise ValueError("CRAWL_OFFER_LIMIT 必须为正整数")

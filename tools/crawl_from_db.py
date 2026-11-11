@@ -15,8 +15,10 @@ from contextlib import AsyncExitStack, contextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from time import monotonic, perf_counter
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from g2g import config, db
+from g2g.coin_offers import G2G_COIN_PAGE_SIZE, CoinApiUnavailable, parse_coin_offers
 from g2g.crawl_filter import compile_policies, identifiers, number, select_top3
 
 # 货币符号 → 货币代码映射（页面实际显示的货币）
@@ -525,25 +527,24 @@ async def _refresh_other_offer_price(page, item, timeout_ms, stage):
 
 async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enhance_stores=None, policies=None) -> list:
     """爬取游戏币分类页 #pcOtherOffer 下的竞品商户卡片"""
-    offer_limit = config.CRAWL_OFFER_LIMIT
     print(f"  [*] 打开游戏币页面: {url}")
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
     # 分类页的竞品列表是异步渲染的，先等待容器和首批卡片出现。
-    card_selector = "#pcOtherOffer .other-seller--gradient"
+    cards = page.locator("#pcOtherOffer .other-seller--gradient")
     for i in range(60):
-        cards = await page.query_selector_all(card_selector)
-        if cards:
-            print(f"  -> 检测到 {len(cards)} 个竞品商户 ({i + 1}s)")
+        count = await cards.count()
+        if count:
+            print(f"  -> 检测到 {count} 个竞品商户 ({i + 1}s)")
             break
         await asyncio.sleep(1)
 
-    # 达到抓取上限即停止等待；不足时才尝试滚动加载。
+    # 等待首屏渲染稳定，不滚动或翻页取额外候选。
     previous_count = -1
     stable_rounds = 0
     for _ in range(10):
-        count = len(await page.query_selector_all(card_selector))
-        if count >= offer_limit:
+        count = await cards.count()
+        if count >= G2G_COIN_PAGE_SIZE:
             break
         if count == previous_count:
             stable_rounds += 1
@@ -552,7 +553,6 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enh
         if stable_rounds >= 2:
             break
         previous_count = count
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await asyncio.sleep(2)
 
     items_raw = await page.evaluate(
@@ -641,15 +641,22 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enh
             });
             return results;
         }
-        """, offer_limit,
+        """, G2G_COIN_PAGE_SIZE,
     )
 
+    items = parse_other_offer_rows(filter_excluded_stores(items_raw[:G2G_COIN_PAGE_SIZE])[:g2g_coin_save_limit()])
+    if refresh_unit_prices:
+        return await refresh_other_offer_prices(page, items, enhance_stores=enhance_stores, policies=policies)
+    return items
+
+
+def parse_other_offer_rows(items_raw):
     items = []
     valid_currency_codes = {
         "USD", "SGD", "EUR", "GBP", "AUD", "CAD", "JPY", "CNY", "HKD",
         "MYR", "KRW", "INR", "THB", "PHP", "IDR", "CHF", "NZD", "BRL",
     }
-    for raw in filter_excluded_stores(items_raw):
+    for raw in items_raw:
         item = dict(raw)
         price_raw = raw.get("unit_price_raw", "")
         currency_label = raw.get("currency_label", "").strip().upper()
@@ -666,9 +673,73 @@ async def scrape_other_offer_page(page, url: str, refresh_unit_prices=False, enh
         item.pop("currency_label", None)
         items.append(item)
 
-    if refresh_unit_prices:
-        return await refresh_other_offer_prices(page, items, enhance_stores=enhance_stores, policies=policies)
     return items
+
+
+G2G_COIN_GROUP_PATH = re.compile(r"/(?:[a-z]{2}(?:-[a-zA-Z]{2})?/)?categories/([a-z0-9-]+)/offer/group/?")
+
+
+def g2g_coin_save_limit():
+    return min(10, config.CRAWL_OFFER_LIMIT)
+
+
+def g2g_coin_group(url):
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.netloc.lower() not in {"www.g2g.com", "g2g.com"}:
+        return None
+    return G2G_COIN_GROUP_PATH.fullmatch(parts.path)
+
+
+def g2g_coin_cheapest_url(url):
+    if not g2g_coin_group(url):
+        return url
+    parts = urlsplit(url)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    paging = {"page", "page_size"}
+    if not any(k in paging for k, _ in query) and [v for k, v in query if k == "sort"] == ["lowest_price"]:
+        return url
+    query = [(k, v) for k, v in query if k not in paging and k != "sort"]
+    query.append(("sort", "lowest_price"))
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def g2g_coin_search_params(url):
+    """仅映射可还原为同一筛选列表的页面；其余交回原页面处理。"""
+    category = g2g_coin_group(url)
+    if not category:
+        return None
+    parts = urlsplit(url)
+    if parts.fragment:
+        return None
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k not in {"sort", "page", "page_size"}]
+    filters = dict(query)
+    if (len(filters) != len(query) or filters.keys() - {"region_id", "fa"}
+            or not all(filters.values()) or not filters.get("fa")):
+        return None
+    params = {"seo_term": category[1], "filter_attr": filters["fa"], "sort": "lowest_price",
+              "group": "0", "page_size": str(G2G_COIN_PAGE_SIZE), "country": "US", "currency": "USD", "v": "v2"}
+    if "region_id" in filters:
+        params["region_id"] = filters["region_id"]
+    return params
+
+
+def verify_coin_search_scope(payload, params, limit):
+    """响应中的分类、区服和属性须与目标一致，避免接口忽略筛选后保存其他市场。"""
+    attrs = [part.partition(":") for part in params["filter_attr"].split("|")]
+    if any(not key or not sep or not value for key, sep, value in attrs):
+        raise CoinApiUnavailable("无法核对商品属性")
+    records = payload["payload"]["results"]
+    for row in records[:limit]:
+        if row.get("seo_term") != params["seo_term"]:
+            raise CoinApiUnavailable("结果分类与目标不一致")
+        if "region_id" in params and row.get("region_id") != params["region_id"]:
+            raise CoinApiUnavailable("结果区服与目标不一致")
+        selected = row.get("filter_attributes") or {}
+        for key, _, value in attrs:
+            choices = selected.get(key)
+            if not isinstance(choices, list) or value not in choices:
+                raise CoinApiUnavailable("结果商品属性与目标不一致")
 
 
 ELD_API_FETCH_SIZE = 150
@@ -1197,6 +1268,7 @@ class CrawlSession:
         self.page = None
         self.browser_cleanup_pending = False
         self.eldorado_request = None
+        self.g2g_request = None
 
     async def __aenter__(self):
         await self.resources.__aenter__()
@@ -1298,6 +1370,49 @@ class CrawlSession:
             if not await self._close_g2g_context():
                 await self._close_browser()
 
+    async def g2g_json(self, endpoint, params):
+        if self.g2g_request is None:
+            playwright = await self.get_playwright()
+            self.g2g_request = await playwright.request.new_context()
+            self.resources.push_async_callback(self.g2g_request.dispose)
+        response = await self.g2g_request.get(
+            f"{config.API_BASE}/v3/offer/{endpoint}", params=params, timeout=15000,
+            headers={"Cache-Control": "no-cache, no-store"},
+        )
+        try:
+            if not response.ok:
+                raise CoinApiUnavailable(f"HTTP {response.status}")
+            return await response.json()
+        finally:
+            await response.dispose()
+
+    async def get_g2g_coin_title(self, slug):
+        data = await self.g2g_json("keyword_info", {"seo_term": slug, "include_relation_detail": "1", "v": "v2"})
+        detail = data["payload"]["relation_detail"]
+        code = (detail.get("brand_display_config") or {}).get("brand_code")
+        title = code.upper() if code else detail.get("brand_name")
+        if not isinstance(title, str) or not title.strip():
+            raise CoinApiUnavailable("未取得游戏币页面商品标题")
+        return title
+
+    async def try_g2g_coin_api(self, url):
+        params = g2g_coin_search_params(url)
+        if params is None:
+            return None
+        try:
+            with timed_stage("G2G 游戏币列表 API"):
+                payload = await self.g2g_json("search", params)
+                verify_coin_search_scope(payload, params, G2G_COIN_PAGE_SIZE)
+                rows = parse_other_offer_rows(parse_coin_offers(payload, g2g_coin_save_limit()))
+                if rows:
+                    title = await self.get_g2g_coin_title(params["seo_term"])
+                    for row in rows:
+                        row["product_title"] = title
+                return rows
+        except Exception as error:
+            print(f"  [!] G2G 列表 API 不可用，回退网页: {error}", flush=True)
+            return None
+
     async def scrape_eldorado(self, url):
         if self.eldorado_request is None:
             playwright = await self.get_playwright()
@@ -1383,6 +1498,7 @@ async def crawl_target(session, idx, target, total):
 
     target_started = perf_counter()
     inserted = 0
+    used_g2g_page = False
     try:
         # 1 优先按绑定店铺加强，空名单按策略 Top3 加强；均保存全部候选。
         crawl_type = target.get("crawl_type") or 0
@@ -1405,15 +1521,22 @@ async def crawl_target(session, idx, target, total):
         if category == "ELD游戏币":
             items = await session.scrape_eldorado(url)
         elif category in {"金币", "游戏币"}:
-            page = await session.get_g2g_page()
+            url = g2g_coin_cheapest_url(url)
             if enhance_enabled:
+                used_g2g_page = True
+                page = await session.get_g2g_page()
                 items = await scrape_other_offer_page(
                     page, url, refresh_unit_prices=True,
                     enhance_stores=enhance_stores, policies=enhance_policies,
                 )
             else:
-                items = await scrape_other_offer_page(page, url)
+                items = await session.try_g2g_coin_api(url)
+                if items is None:
+                    used_g2g_page = True
+                    page = await session.get_g2g_page()
+                    items = await scrape_other_offer_page(page, url)
         else:
+            used_g2g_page = True
             page = await session.get_g2g_page()
             items = await scrape_page(page, url)
         print(f"  -> 提取 {len(items)} 条")
@@ -1437,7 +1560,7 @@ async def crawl_target(session, idx, target, total):
         print(f"  -> 错误: {e}（目标耗时: {perf_counter() - target_started:.2f} 秒）")
         return inserted, True, None, None
     finally:
-        if category != "ELD游戏币":
+        if used_g2g_page:
             await session.park_g2g_page()
 
 

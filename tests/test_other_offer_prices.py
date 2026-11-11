@@ -73,7 +73,7 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(row["unit_price"] == row["price"] for row in rows))
         self.assertEqual(len(result), 4)
 
-    async def test_page_only_extracts_first_ten_before_enhancement_without_extra_loading(self):
+    async def test_page_selects_ten_nonexcluded_first_page_rows_before_enhancement(self):
         await self.page.evaluate("""() => {
             const container = document.querySelector('#pcOtherOffer');
             container.innerHTML = '';
@@ -100,7 +100,7 @@ class OtherOfferPriceTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     detail.assert_not_awaited()
                 self.assertEqual([row["seller_id"] for row in rows],
-                                 [f"seller{i}" for i in range(10) if not excluded or i not in (0, 3)])
+                                 [f"seller{i}" for i in range(20) if not excluded or i not in (0, 3)][:10])
                 async_stub.sleep.assert_not_awaited()
 
     async def test_generic_g2g_cards_exclude_shops_within_first_eight(self):

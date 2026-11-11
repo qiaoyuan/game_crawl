@@ -26,7 +26,7 @@ class ExcludedStoreTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(crawl_type=crawl_type, stores=stores):
                 page = MagicMock()
                 page.goto = AsyncMock()
-                page.query_selector_all = AsyncMock(return_value=[None] * 10)
+                page.locator.return_value.count = AsyncMock(return_value=20)
                 # These invalid prices/ratings would fail parsing if own shops were not skipped first.
                 page.evaluate = AsyncMock(return_value=[
                     {"seller_id": "vivi_store", "unit_price_raw": ["invalid"], "rating": ["invalid"]},
