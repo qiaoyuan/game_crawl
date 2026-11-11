@@ -18,6 +18,7 @@ from time import monotonic, perf_counter
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from g2g import config, db
+from g2g.coin_detail import parse_coin_detail
 from g2g.coin_offers import G2G_COIN_PAGE_SIZE, CoinApiUnavailable, parse_coin_offers
 from g2g.crawl_filter import compile_policies, identifiers, number, select_top3
 
@@ -421,16 +422,18 @@ def parse_detail_unit_price(text):
     return match[1].replace(",", ""), match[2].upper()
 
 
-async def refresh_other_offer_prices(page, items, timeout_ms=15000, enhance_stores=None, policies=None):
-    """逐店查看详情；任何单价未确认时中止目标，避免用旧价生成改价通知。"""
+def select_enhance_offers(items, enhance_stores, policies):
     stores = identifiers(enhance_stores)
     if stores:
-        candidates = [item for item in items if stores & identifiers(
+        return [item for item in items if stores & identifiers(
             [item.get("seller_id"), item.get("seller_name")]
         )]
-    else:
-        # 空名单按列表报价选策略 Top3，仅决定加强对象，不裁剪入库候选。
-        candidates = select_top3(items, policies or [])
+    return select_top3(items, policies or [])
+
+
+async def refresh_other_offer_prices(page, items, timeout_ms=15000, enhance_stores=None, policies=None):
+    """逐店查看详情；任何单价未确认时中止目标，避免用旧价生成改价通知。"""
+    candidates = select_enhance_offers(items, enhance_stores, policies)
     print(f"  -> 店铺加强: {len(items)} 条中需查看 {len(candidates)} 家")
     started = perf_counter()
     for index, item in enumerate(candidates, 1):
@@ -1370,13 +1373,13 @@ class CrawlSession:
             if not await self._close_g2g_context():
                 await self._close_browser()
 
-    async def g2g_json(self, endpoint, params):
+    async def g2g_json(self, path, params):
         if self.g2g_request is None:
             playwright = await self.get_playwright()
             self.g2g_request = await playwright.request.new_context()
             self.resources.push_async_callback(self.g2g_request.dispose)
         response = await self.g2g_request.get(
-            f"{config.API_BASE}/v3/offer/{endpoint}", params=params, timeout=15000,
+            f"{config.API_BASE}/{path}", params=params, timeout=15000,
             headers={"Cache-Control": "no-cache, no-store"},
         )
         try:
@@ -1387,7 +1390,7 @@ class CrawlSession:
             await response.dispose()
 
     async def get_g2g_coin_title(self, slug):
-        data = await self.g2g_json("keyword_info", {"seo_term": slug, "include_relation_detail": "1", "v": "v2"})
+        data = await self.g2g_json("v3/offer/keyword_info", {"seo_term": slug, "include_relation_detail": "1", "v": "v2"})
         detail = data["payload"]["relation_detail"]
         code = (detail.get("brand_display_config") or {}).get("brand_code")
         title = code.upper() if code else detail.get("brand_name")
@@ -1395,22 +1398,45 @@ class CrawlSession:
             raise CoinApiUnavailable("未取得游戏币页面商品标题")
         return title
 
-    async def try_g2g_coin_api(self, url):
+    async def refresh_coin_api_prices(self, rows, enhance_stores, policies):
+        candidates = select_enhance_offers(rows, enhance_stores, policies)
+        print(f"  -> 店铺加强: {len(rows)} 条中需请求 {len(candidates)} 笔详情", flush=True)
+        for row in candidates:
+            listing = row["_listing"]
+            offer_id = listing.get("offer_id")
+            if not isinstance(offer_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", offer_id):
+                raise CoinApiUnavailable("无法确认加强报价 ID")
+            with timed_stage(f"G2G 店铺详情 API {row['seller_name']}"):
+                response = await self.g2g_json(
+                    f"offer/{offer_id}", {"currency": "USD", "country": "US", "include_out_of_stock": "1"},
+                )
+                price = parse_coin_detail(response, listing)
+                row.update(price=price, unit_price=price, currency="USD",
+                           price_label="单价", unit_price_source="offer_detail_api")
+                print(f"  -> 店铺 {row['seller_name']} 详情单价: {price} USD", flush=True)
+        for row in rows:
+            del row["_listing"]
+
+    async def try_g2g_coin_api(self, url, *, enhance=False, enhance_stores=None, policies=None):
         params = g2g_coin_search_params(url)
         if params is None:
             return None
+        label = "G2G 店铺加强 API" if enhance else "G2G 游戏币列表 API"
         try:
-            with timed_stage("G2G 游戏币列表 API"):
-                payload = await self.g2g_json("search", params)
+            with timed_stage(label):
+                payload = await self.g2g_json("v3/offer/search", params)
                 verify_coin_search_scope(payload, params, G2G_COIN_PAGE_SIZE)
-                rows = parse_other_offer_rows(parse_coin_offers(payload, g2g_coin_save_limit()))
+                rows = parse_other_offer_rows(parse_coin_offers(payload, g2g_coin_save_limit(), include_listing=enhance))
                 if rows:
                     title = await self.get_g2g_coin_title(params["seo_term"])
                     for row in rows:
                         row["product_title"] = title
+                if enhance:
+                    await self.refresh_coin_api_prices(rows, enhance_stores, policies)
                 return rows
         except Exception as error:
-            print(f"  [!] G2G 列表 API 不可用，回退网页: {error}", flush=True)
+            mode = "店铺加强" if enhance else "列表"
+            print(f"  [!] G2G {mode} API 不可用，回退网页: {error}", flush=True)
             return None
 
     async def scrape_eldorado(self, url):
@@ -1522,18 +1548,18 @@ async def crawl_target(session, idx, target, total):
             items = await session.scrape_eldorado(url)
         elif category in {"金币", "游戏币"}:
             url = g2g_coin_cheapest_url(url)
-            if enhance_enabled:
+            items = await session.try_g2g_coin_api(
+                url, enhance=enhance_enabled, enhance_stores=enhance_stores, policies=enhance_policies,
+            )
+            if items is None:
                 used_g2g_page = True
                 page = await session.get_g2g_page()
-                items = await scrape_other_offer_page(
-                    page, url, refresh_unit_prices=True,
-                    enhance_stores=enhance_stores, policies=enhance_policies,
-                )
-            else:
-                items = await session.try_g2g_coin_api(url)
-                if items is None:
-                    used_g2g_page = True
-                    page = await session.get_g2g_page()
+                if enhance_enabled:
+                    items = await scrape_other_offer_page(
+                        page, url, refresh_unit_prices=True,
+                        enhance_stores=enhance_stores, policies=enhance_policies,
+                    )
+                else:
                     items = await scrape_other_offer_page(page, url)
         else:
             used_g2g_page = True

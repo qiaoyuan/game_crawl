@@ -27,9 +27,9 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 
 `CRAWL_WORKER_COUNT` 由 shell 启动脚本读取：系统环境变量已设置时优先使用，否则只解析生产目录 `.env.prod` 的同名字段；文件或字段缺失时默认 1。支持空白、单/双引号、行尾注释、CRLF 和 `export` 前缀，同名字段取最后一项；配置内容不作为 shell 执行，也不加载其他字段。空值、非整数或小于 1 时在启动前报错。修改配置对下一次启动生效，不调整运行中的 worker；生产默认窗口为 300 秒，须等旧窗口全部 worker 退出后才会整体换组；cron 中设置的环境变量同样会覆盖文件。抓取条数控制每个目标的竞品数量，不控制领取的任务数量。
 
-- G2G 金币/游戏币分类列表固定最低价排序、第一页。对标准 HTTPS G2G `/categories/<slug>/offer/group`（可带语言前缀），覆盖 URL 的 sort，忽略 page/page_size。普通类型在可映射的链接上优先匿名请求 `/v3/offer/search`，固定 sort=lowest_price、page_size=20、group=0、US/USD、v=v2；slug 映射为 seo_term，fa 完整解码为 filter_attr（保留多条件），region_id 有则透传。缺少 fa、未知筛选、重复筛选或不可映射路径走原页面。接口结果逐行核对分类、显式区服和请求属性。
-- G2G 游戏币只取第一页最多 20 条，按最低价列表顺序先排除配置中的自有店铺，再保存前 min(CRAWL_OFFER_LIMIT,10) 条。可从同页后面的商户补足，不翻页，不按评级、库存等再筛掉竞品。非空页全部被排除时成功返回零条。加强类型直接从网页同样范围选出候选，再按原规则点店铺详情。
-- API 价格按网页的美元列表展示价取值：原币非 USD 且有单独的 USD 定价时优先使用该价，否则用 display_price；保留与网页相同的卖家标识（店铺名）、库存、好评率等字段。每轮重新请求报价和库存，有可保存的行时也重新请求 keyword_info 获取分类显示名。两类请求均带 Cache-Control: no-cache, no-store，爬虫不跨轮复用响应数据。每个 worker 复用独立的 G2G 请求上下文，响应读取后释放；成功无需创建 Chromium 或 Page。请求、校验、价格或标题读取失败以及空结果回退一次网页，网页最多读取首屏前 20 张商户卡片，等待数量稳定，不滚动加载。其他 G2G 分类仍走通用 scrape_page 并保留原列表范围。
+- G2G 金币/游戏币分类列表固定最低价排序、第一页。对标准 HTTPS G2G `/categories/<slug>/offer/group`（可带语言前缀），覆盖 URL 的 sort，忽略 page/page_size。普通及加强类型在可映射的链接上优先匿名请求 `/v3/offer/search`，固定 sort=lowest_price、page_size=20、group=0、US/USD、v=v2；slug 映射为 seo_term，fa 完整解码为 filter_attr（保留多条件），region_id 有则透传。缺少 fa、未知筛选、重复筛选或不可映射路径走原页面。接口结果逐行核对分类、显式区服和请求属性。
+- G2G 游戏币只取第一页最多 20 条，按最低价列表顺序先排除配置中的自有店铺，再保存前 min(CRAWL_OFFER_LIMIT,10) 条。可从同页后面的商户补足，不翻页，不按评级、库存等再筛掉竞品。非空页全部被排除时成功返回零条。加强类型在最终候选中按绑定店铺或策略 Top3 选择需要查详情的报价。API 与网页兜底共用同一选店规则，未命中时保存列表，不请求详情。
+- API 价格按网页的美元列表展示价取值：原币非 USD 且有单独的 USD 定价时优先使用该价，否则用 display_price；保留与网页相同的卖家标识（店铺名）、库存、好评率等字段。每轮重新请求报价和库存，有可保存的行时也重新请求 keyword_info 获取分类显示名。列表、分类名和加强详情请求均带 Cache-Control: no-cache, no-store，爬虫不跨轮复用响应数据。每个 worker 复用独立的 G2G 请求上下文，响应读取后释放；成功无需创建 Chromium 或 Page。请求、校验、价格或标题读取失败以及空结果回退一次网页，网页最多读取首屏前 20 张商户卡片，等待数量稳定，不滚动加载。其他 G2G 分类仍走通用 scrape_page 并保留原列表范围。
 - `ELD游戏币` 由 `CrawlSession.scrape_eldorado` 优先调用 `scrape_eldorado_api`，每个 worker 复用独立 Playwright APIRequestContext，带原有英文 User-Agent、语言与 USD/英文偏好 cookie；API 成功不创建 Chromium、BrowserContext 或 Page。无法解析 gameId、请求/JSON 解析失败、非成功响应或无可用结果时，才按需启动 Chromium 并调用 `scrape_eldorado_dom`；每个 DOM 目标使用独立 context 并在结束时关闭，不带 G2G cookie。APIResponse 解析后及时 dispose，worker 结束释放请求、浏览器和 Playwright driver。`scrape_eldorado_page(page, url)` 保留页面调用的 API→DOM 兼容入口，生产轮次不依赖预先创建的页面。
 - ELD 默认与加强类型都固定请求 API 第一页 `pageIndex=1`、`pageSize=150`（常量 `ELD_API_FETCH_SIZE`）。保留 gameId、分类、区服和商品属性筛选，目标 URL 的分页参数不能覆盖。仍发送 `offerSortingCriterion=Cheapest` 作为兼容提示，但不依赖接口排序。读取响应前 150 条候选，先按 `CRAWL_EXCLUDE_STORES` 跳过配置的店铺，被排除行不解析价格、不参与排序；剩余报价优先取 `results[].offer.pricePerUnitInUSD.amount`，用 Decimal 稳定升序排列，再按 `ELD_OFFER_PAGE_SIZE` 截取，默认最低 8 条。同价保留响应顺序，不按字符串排序。不读取改价策略、不按库存筛选，库存为 1 正常保留。过滤后不足 N 条保存实际条数，全部排除成功返回空列表，不触发 DOM。只请求一页，不额外补发或翻页；最低价范围仅限本批最多 150 条。
 - API 优先使用 `pricePerUnitInUSD.amount`，缺失时使用 USD 原价或按 `1 USD = N 展示货币` 的汇率转换，换算使用 Decimal、不预先舍入至 8 位。有效报价必须是有限正数；无效报价使 API 路径回退 DOM，不能当作零价参与最低价排序。DOM 兜底保留 Cheapest/第一页提示及商品筛选，仍只对页面前 N 条排除店铺、解析后按有效 USD 单价升序，不具有 API 的 150 条候选范围；不滚动或翻页、不补位。DOM 无效或非 USD 报价报错，不保存该轮或发完成通知。DOM 仍有原有页面加载、固定 5 秒及卡片/价格等待；API 正常返回时完全跳过这些等待。两个平台条数独立。
@@ -63,11 +63,13 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 
 ## 详情单价与失败边界
 
-- 逐店点击 `#pcOtherOffer .other-seller--gradient` 的“查看/View”，确认 `#pcMain` 店铺身份，并确认价格节点替换或内容刷新；已选中店铺的无操作查看允许使用已加载详情。
+- 加强任务的 API 路径对选中的每一笔报价，使用列表原始 offer_id 匿名 GET `/offer/{offer_id}`（页面切店端点，非列表搜索端点），固定 currency=USD、country=US、include_out_of_stock=1。按原顺序逐笔请求，单请求超时 15 秒；核对报价 ID、内部卖家 ID、店名，以及列表提供的区服、商品属性、品牌、单位与起订量。用于核对的原始记录不写入快照。详情可确认时使用美元 display_price 的完整精度，要求与 converted_unit_price 数值一致，若原币 USD 还须与详情 unit_price 一致；更新 price/unit_price/currency，标记 `unit_price_source=offer_detail_api`。
+- 接口仅采信当地可用、公开在售、库存足以满足多件起购、计量为 1 的普通报价。单件起购、套餐、订阅、批量档位、自定义币种价及其他不能确定单价或身份的情况均回退。任一 API 阶段失败时丢弃整批 API 结果，重新从网页取完整列表、按原配置选店并读取详情；不混合两次抓取的结果。阶段日志 `G2G 店铺加强 API` 覆盖列表和全部所选详情，每家有独立阶段计时；未选中任何店铺也可完成该阶段。
+- 网页兜底逐店点击 `#pcOtherOffer .other-seller--gradient` 的“查看/View”，确认 `#pcMain` 店铺身份，并确认价格节点替换或内容刷新；已选中店铺的无操作查看允许使用已加载详情。
 - 优先读取 `.vue-portal-target .pricing-container` 内“单价/Unit Price”，保留价格精度、币种，更新 price/unit_price/currency，标记 `unit_price_source=offer_detail`。不能使用列表最低/from 价格替代。
 - G2G 数量为 1 时可能隐藏单价节点。仅在可见详情容器唯一、数量输入唯一且明确为 1、金额标签为总金额/总价/Total amount、币种可确认，并通过店铺与金额刷新校验时，将这一件的详情金额作为单价，标记 `offer_detail_single_unit`；多件总价不作为单价。
 - 每家定位、DOM 读取、点击、详情等待及清理统一受默认 15 秒期限约束；点击使用 `no_wait_after=True`，随后单独等待详情。日志记录店铺、阶段、价格和耗时。
-- 候选详情失败时终止该目标，不保存该轮、不推进 `last_crawl_at`、不发完成通知，不静默回退旧列表价。其他未加强行保持列表数据。
+- 网页兜底的候选详情仍失败时终止该目标，不保存该轮、不推进 `last_crawl_at`、不发完成通知，不静默回退旧列表价。其他未加强行保持列表数据。
 
 ## 启动、日志与部署
 
@@ -84,7 +86,7 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 - 参数 `--max-mb`、`--keep`、`--days` 接受正整数，默认 20/3/7；`--wait-seconds` 接受非负整数，默认 30；`--log-dir` 可覆盖日志目录。`cron/crawl-log-cleanup` 提供 Linux root 的 `/etc/cron.d` 配置，每小时第 17 分钟执行一次，输出交给 cron，不额外写清理日志。上传后以 root 将它复制到 `/etc/cron.d/crawl-log-cleanup` 并设权限 644 才会启用；宝塔可等价配置每小时运行 `bash /www/wwwroot/game_crawl/cleanup_logs.sh`。不要重复安装两种调度。清理按检查时刻执行且忙时可能跳过，不能宣称文件大小始终硬限制在 20 MiB，也不能将本地配置当成线上已安装。
 - 日志区分 ELD API 请求模式和按需启动 Chromium 的原因，API 请求有独立阶段计时，并记录第一页 150 条请求、实际候选数及 USD 单价升序选出的条数；单目标完成/失败耗时从类型与策略处理开始，包含资源初始化、抓取和数据库操作，不含目标间隔等待及随后单独记录的页面暂停。worker 耗时从入口开始到资源清理结束，包含数据库任务读取与间隔等待，不含 Python 模块导入或 Xvfb 启动；驻留模式的约 300 秒是多次抓取的调度窗口，不是单轮抓取耗时。shell 汇总按顺序 wait 的完成日志不能当作各 worker 的真实结束时刻，排查耗时优先看 worker 自身日志。
 - `timed_stage` 使用单调计时输出并立即刷新阶段开始、完成或失败日志，原始异常继续向上传递。资源初始化分别记录 Playwright driver、Chromium、G2G context/page，仅实际创建时记录。通用 G2G 卡片路径（物品等）保留页面导航、货币检查、必要时 USD 切换重导航、首批卡片、列表数量/滚动、字段就绪、页面货币、提取及 Python 解析计时。卡片存在/数量检查在页面内返回整数，不创建一批 ElementHandle；仍只在数量不足时滚动，达到上限或数量稳定时结束，并记录卡片数/上限/滚动次数。
-- 通用 G2G 路径在最终候选数量确定后检查前 N 条的卖家身份（ID 或名称）和含数字的价格文本：齐全立即继续，否则最多等 3 秒，替代固定 sleep。标题、好评率、库存仍按原可选字段提取；字段就绪超时告警后沿用原提取/过滤行为，其他页面错误继续上抛。此优化不修改价格解析、币种或排除规则；金币/游戏币详情加强仍沿用原有独立路径与逐店阶段日志。不能把本地 DOM 验证当成真实网站耗时保证。
+- 通用 G2G 路径在最终候选数量确定后检查前 N 条的卖家身份（ID 或名称）和含数字的价格文本：齐全立即继续，否则最多等 3 秒，替代固定 sleep。标题、好评率、库存仍按原可选字段提取；字段就绪超时告警后沿用原提取/过滤行为，其他页面错误继续上抛。此优化不修改价格解析、币种或排除规则；金币/游戏币详情加强的网页兜底使用独立的逐店阶段日志。不能把本地 DOM 验证当成真实网站耗时保证。
 - `deploy_prod.sh` 会 rsync、安装依赖和验证环境，属于真实部署；其帮助文字可能滞后，以启动脚本为准。维护规范不等于运行部署。迁移文件存在也不代表已执行；有字段变更时同步后台模型、验证、UI 和迁移。
 
 ## 验证与规范维护
@@ -97,7 +99,7 @@ rtk proxy bash -n run_crawl_and_consume.sh
 rtk git diff --check
 ```
 
-`test_g2g_coin_api.py` 覆盖最低价、区服及组合筛选、首批 20 条排除后补位及保存上限、跨轮重新获取价格、库存和标题、回退和加强分流。`test_other_offer_prices.py` 覆盖加强选择、异步价格归属、列表上限与各 DOM 路径的全局排除；`test_eldorado_limit.py` 覆盖单次请求第一页 150 条、保存上限独立、第 8 条之后的低价入选、最多处理 150 条、先排除再取前 N 条、USD 与展示币种排序差异、商品筛选透传、数值排序/精度/同价稳定顺序、USD 换算、库存 1 保留、无效报价拒绝、价格解析前排除及全部排除时不回退 DOM；`test_eldorado_fallback.py` 用本地真实 DOM 覆盖最低价第一页 URL、前 N 条排序、独立上限、排除后不补位及全部排除；`test_crawl_excluded_stores.py` 覆盖多名字/ID 归一化完整匹配、空配置、默认与加强类型在价格处理前排除、剩余候选入库及通知条数；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_interval.py` 用模拟时钟覆盖连续三轮 ELD 目标、抓取耗时与提前触发、已到期目标绕过队列前部等待、最近到期者优先、目标处理后重新判断到期、提前唤醒不提前抓取、无效任务及历史时间、等待/跳过边界、失败不推进时间及开始时间持久化；`test_crawl_timing.py` 覆盖页面导航/卡片等待/提取的独立计时、阶段失败保留原始异常、driver/browser/page 初始化独立计时及复用不重复计时。`test_crawl_workers.py` 覆盖分片、dotenv 进程数加载、环境变量覆盖、非法值拒绝、配置不执行、等锁成功/超时/错误及失败汇总，并以操作系统 flock 验证一轮运行、一个等待者、额外触发退出和两轮无重叠。`test_crawl_session.py` 覆盖 ELD 两种类型从 150 条候选先排除自有店铺，再按 USD 升序保存最低 8 条并通知、全部排除时零条成功、不需执行时不启动 driver、混合目标复用浏览器与 ELD context 隔离、API 错误/空结果/无法解析 URL 的 DOM 兜底、失败目标不通知且继续后续目标、页面暂停复用及失败重建、初始化中途失败与 browser 断连、清理超时和防止叠加 browser、资源释放；通过本地 HTTP 服务与真实 Playwright 验证独立请求无需 Chromium，不能将其当作真实平台线上验证。
+`test_g2g_coin_api.py` 覆盖最低价、区服及组合筛选、首批 20 条排除后补位及保存上限、跨轮重新获取价格、库存和标题、绑定名单、策略 Top3、详情 API 逐轮刷新及部分失败整批回退；`test_coin_detail.py` 覆盖详情报价归属、美元精度、数量及套餐等回退边界。`test_other_offer_prices.py` 覆盖加强选择、异步价格归属、列表上限与各 DOM 路径的全局排除；`test_eldorado_limit.py` 覆盖单次请求第一页 150 条、保存上限独立、第 8 条之后的低价入选、最多处理 150 条、先排除再取前 N 条、USD 与展示币种排序差异、商品筛选透传、数值排序/精度/同价稳定顺序、USD 换算、库存 1 保留、无效报价拒绝、价格解析前排除及全部排除时不回退 DOM；`test_eldorado_fallback.py` 用本地真实 DOM 覆盖最低价第一页 URL、前 N 条排序、独立上限、排除后不补位及全部排除；`test_crawl_excluded_stores.py` 覆盖多名字/ID 归一化完整匹配、空配置、默认与加强类型在价格处理前排除、剩余候选入库及通知条数；`test_crawl_filter.py` 覆盖策略、完整保存和通知；`test_crawl_interval.py` 用模拟时钟覆盖连续三轮 ELD 目标、抓取耗时与提前触发、已到期目标绕过队列前部等待、最近到期者优先、目标处理后重新判断到期、提前唤醒不提前抓取、无效任务及历史时间、等待/跳过边界、失败不推进时间及开始时间持久化；`test_crawl_timing.py` 覆盖页面导航/卡片等待/提取的独立计时、阶段失败保留原始异常、driver/browser/page 初始化独立计时及复用不重复计时。`test_crawl_workers.py` 覆盖分片、dotenv 进程数加载、环境变量覆盖、非法值拒绝、配置不执行、等锁成功/超时/错误及失败汇总，并以操作系统 flock 验证一轮运行、一个等待者、额外触发退出和两轮无重叠。`test_crawl_session.py` 覆盖 ELD 两种类型从 150 条候选先排除自有店铺，再按 USD 升序保存最低 8 条并通知、全部排除时零条成功、不需执行时不启动 driver、混合目标复用浏览器与 ELD context 隔离、API 错误/空结果/无法解析 URL 的 DOM 兜底、失败目标不通知且继续后续目标、页面暂停复用及失败重建、初始化中途失败与 browser 断连、清理超时和防止叠加 browser、资源释放；通过本地 HTTP 服务与真实 Playwright 验证独立请求无需 Chromium，不能将其当作真实平台线上验证。
 
 `test_crawl_resident.py` 覆盖驻留模式的周期、最早到期公平性、失败退避、元数据刷新、查询失败退避及暂停旧快照、墙钟前后调整、空分片、窗口边界及单轮回退；`test_g2g_readiness.py` 以本地真实 DOM 覆盖延迟卖家/价格、滚动新增候选、前 N 范围与排除不补位、字段超时和页面错误。`test_crawl_workers.py` 还验证生产 `--scheduled` 参数、所有 worker 退出后持锁维护、维护失败不覆盖抓取退出状态。
 

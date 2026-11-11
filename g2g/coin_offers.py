@@ -65,7 +65,7 @@ def _currency_entry(entries):
     return next((e for e in entries if e.get("currency") == "USD"), None)
 
 
-def parse_coin_offers(payload, limit):
+def parse_coin_offers(payload, limit, *, include_listing=False):
     """按页面顺序，在第一页最多 20 个卖家中先排除店铺，再取前 N 个。"""
     if not isinstance(payload, dict) or payload.get("code") != 2000:
         raise CoinApiUnavailable("游戏币搜索未成功")
@@ -130,6 +130,9 @@ def parse_coin_offers(payload, limit):
             item["delivery_time"] = delivery
         if wholesale:
             item["has_volume_discount"] = True
+        if include_listing:
+            # 仅用于加强时关联同一笔 offer，入库前移除。
+            item["_listing"] = row
         items.append(item)
         if len(items) >= limit:
             break

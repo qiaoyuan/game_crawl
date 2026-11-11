@@ -1,4 +1,5 @@
-"""普通 G2G 游戏币列表可用 API 时与原快照保持一致，异常回退到页面。"""
+"""G2G 游戏币列表和加强详情走 API 时保留完整快照，异常整单回退到页面。"""
+import json
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from io import StringIO
@@ -38,6 +39,12 @@ def brand_response(code):
         "brand_display_config": {"brand_code": code}, "brand_name": "Long game name",
     }}}
     return result
+
+
+def identified_offers(entries):
+    """生成不同商户的报价；买家可见店名与 G2G 内部卖家、报价 ID 有区别。"""
+    return [dict(offer(name, price), offer_id=f"G1793605252{i:03d}AB", seller_id=str(1001230000 + i))
+            for i, (name, price) in enumerate(entries)]
 
 
 class CoinSearchParamsTests(unittest.TestCase):
@@ -108,6 +115,41 @@ class CoinApiCrawlTests(unittest.IsolatedAsyncioTestCase):
         saved, failed, _, _ = await crawl.crawl_target(session, 0, target, 1)
         self.assertFalse(failed)
         return saved
+
+    def mock_market(self, listings, detail_replies):
+        """仅模拟匿名 HTTP，保留生产解析、价格校验和写入逻辑。"""
+        ordered = {shop: iter(prices) for shop, prices in detail_replies.items()}
+        by_id = {row["offer_id"]: row for row in listings}
+        visited = []
+
+        def fetch(url, *, params, headers, **kwargs):
+            path = urlsplit(url).path
+            if path == "/v3/offer/search":
+                return api_response(listings)
+            if path == "/v3/offer/keyword_info":
+                return brand_response("AI2")
+            offer_id = path.removeprefix("/offer/")
+            listing = by_id[offer_id]
+            name = listing["username"]
+            visited.append(name)
+            self.assertEqual(headers["Cache-Control"], "no-cache, no-store")
+            self.assertEqual(params["currency"], "USD")
+            self.assertEqual(params["country"], "US")
+            self.assertEqual(str(params["include_out_of_stock"]), "1")
+            reply = next(ordered[name])
+            if isinstance(reply, Exception):
+                raise reply
+            response = api_response([])
+            detail = dict(listing, display_price=reply, unit_price=reply, converted_unit_price=reply,
+                          offer_type="public", is_supported_locally=True,
+                          offer_currency="USD", status="live", is_sold_out=False, is_expired=False,
+                          unit_quantity=1, is_subscription=False, pricing_packages=None, package_settings=None,
+                          wholesale_details=[], other_wholesale_details=[], other_pricing=[])
+            response.json.return_value = {"code": 2000, "payload": detail}
+            return response
+
+        self.request.get.side_effect = fetch
+        return visited
 
     async def test_api_snapshot_fills_from_first_page_after_exclusion_without_browser(self):
         first = api_response([offer("own_SHOP", "bad"), offer("SellerB"), offer("SellerC")])
@@ -208,18 +250,96 @@ class CoinApiCrawlTests(unittest.IsolatedAsyncioTestCase):
         self.notify.assert_not_called()
         self.update.assert_not_called()
 
-    async def test_enhanced_target_requires_page_detail_and_unsupported_url_skips_api(self):
+    async def test_unsupported_url_uses_enhanced_dom_with_lowest_sort_and_extra_filters(self):
         async with crawl.CrawlSession() as session:
-            await self.crawl_one(session, url=COIN_URL.replace("&sort=lowest_price", ""),
+            url = COIN_URL.replace("&sort=lowest_price", "") + "&server_filter=extra"
+            await self.crawl_one(session, url=url,
                                  crawl_type="top3", enhance_stores="bound_shop")
             self.assertEqual(self.dom.await_count, 1)
             enhanced_url = self.dom.await_args.args[1]
-            self.assertEqual(parse_qs(urlsplit(enhanced_url).query), parse_qs(urlsplit(COIN_URL).query))
+            expected = dict(parse_qs(urlsplit(COIN_URL).query), server_filter=["extra"])
+            self.assertEqual(parse_qs(urlsplit(enhanced_url).query), expected)
             self.assertTrue(self.dom.await_args.kwargs["refresh_unit_prices"])
             self.assertEqual(self.dom.await_args.kwargs["enhance_stores"], "bound_shop")
             unknown_url = COIN_URL.replace("lowest_price", "popular") + "&server_filter=extra"
             await self.crawl_one(session, url=unknown_url)
-            expected = dict(parse_qs(urlsplit(COIN_URL).query), server_filter=["extra"])
             self.assertEqual(parse_qs(urlsplit(self.dom.await_args.args[1]).query), expected)
         self.request.get.assert_not_awaited()
         self.playwright.request.new_context.assert_not_awaited()
+
+    async def test_bound_detail_is_fresh_each_round_and_only_final_rows_are_saved(self):
+        listings = identified_offers([("own_SHOP", "bad"), ("ShopA", "0.10"),
+                                      ("ShopB", "0.11"), ("Outside", "0.12")])
+        visits = self.mock_market(listings, {"ShopB": ["0.17", "0.19"]})
+        with patch.object(db, "get_crawl_strategies") as policies:
+            async with crawl.CrawlSession() as session:
+                for i in range(2):
+                    await self.crawl_one(session, target_id=10 + i, crawl_type="1",
+                                         enhance_stores="own_shop,shopb,Outside")
+        policies.assert_not_called()
+        self.assertEqual(visits, ["ShopB", "ShopB"])
+        self.dom.assert_not_awaited()
+        self.page.assert_not_awaited()
+        for i, price in enumerate(("0.17", "0.19")):
+            saved = self.save.call_args_list[i].args[2]
+            self.assertEqual([row["seller_name"] for row in saved], ["ShopA", "ShopB"])
+            self.assertEqual([row["price"] for row in saved], ["0.1", price])
+            self.assertEqual(saved[1]["unit_price"], price)
+            self.assertEqual(saved[1]["currency"], "USD")
+            self.assertEqual(saved[1]["unit_price_source"], "offer_detail_api")
+            # save_crawl_data serializes each item in raw_data, so examine the entire nested value.
+            encoded = json.dumps(saved)
+            for listing in listings:
+                self.assertNotIn(listing["offer_id"], encoded)
+                self.assertNotIn(listing["seller_id"], encoded)
+        self.assertEqual([c.args for c in self.notify.call_args_list], [(10, 8, 2), (11, 8, 2)])
+
+    async def test_unmatched_bound_names_and_empty_strategies_keep_all_list_prices(self):
+        listings = identified_offers([("ShopA", "1.2"), ("ShopB", "1.4")])
+        visits = self.mock_market(listings, {})
+        with patch.object(db, "get_crawl_strategies", return_value=[]) as strategies:
+            async with crawl.CrawlSession() as session:
+                await self.crawl_one(session, target_id=10, crawl_type=1, enhance_stores="absent")
+                await self.crawl_one(session, target_id=11, crawl_type=1, enhance_stores="")
+        strategies.assert_called_once_with(11)
+        self.assertEqual(visits, [])
+        self.dom.assert_not_awaited()
+        for call in self.save.call_args_list:
+            self.assertEqual([row["price"] for row in call.args[2]], ["1.2", "1.4"])
+
+    async def test_top3_selected_using_list_prices_before_enhancement_preserves_all_rows(self):
+        listings = identified_offers([("own_shop", "bad"), ("Blocked", "1"), ("B", "2"),
+                                      ("C", "3"), ("D", "4"), ("E", "5")])
+        visits = self.mock_market(listings, {"B": ["21"], "C": ["31"], "D": ["41"]})
+        policy = {"config": {"blacklist_stores": "Blocked"}, "currency": "USD"}
+        with patch.object(db, "get_crawl_strategies", return_value=[policy]), \
+             patch.object(config, "CRAWL_OFFER_LIMIT", 10):
+            async with crawl.CrawlSession() as session:
+                self.assertEqual(await self.crawl_one(session, crawl_type="top3"), 5)
+        self.assertEqual(visits, ["B", "C", "D"])
+        rows = self.save.call_args.args[2]
+        self.assertEqual([r["seller_id"] for r in rows], ["Blocked", "B", "C", "D", "E"])
+        self.assertEqual([r["price"] for r in rows], ["1", "21", "31", "41", "5"])
+        self.dom.assert_not_awaited()
+
+    async def test_partly_successful_detail_round_discards_api_rows_and_repeats_enhancement_on_page(self):
+        listings = identified_offers([("B", "0.3"), ("C", "0.4")])
+        visits = self.mock_market(listings, {"B": ["0.6", "0.7"],
+                                             "C": [TimeoutError("detail"), TimeoutError("detail")]})
+        dom_rows = [{"seller_id": "different_dom_seller", "price": "1.123"}]
+        self.dom.side_effect = [dom_rows, TimeoutError("web detail failed")]
+        async with crawl.CrawlSession() as session:
+            for i in (10, 11):
+                target = {"id": i, "game_product_id": 3, "category": "金币", "url": COIN_URL,
+                          "crawl_type": 1, "enhance_stores": "B,C"}
+                count, failed, _, _ = await crawl.crawl_target(session, 0, target, 1)
+                self.assertEqual((count, failed), (1, False) if i == 10 else (0, True))
+        self.assertEqual(visits, ["B", "C", "B", "C"])
+        self.assertEqual(self.dom.await_count, 2)
+        for call in self.dom.await_args_list:
+            self.assertTrue(call.kwargs["refresh_unit_prices"])
+            self.assertEqual(call.kwargs["enhance_stores"], "B,C")
+        self.save.assert_called_once()
+        self.assertEqual(self.save.call_args.args[2], dom_rows)
+        self.update.assert_called_once()
+        self.notify.assert_called_once_with(10, 8, 1)
