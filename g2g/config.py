@@ -71,12 +71,30 @@ if CRAWL_WORKER_RUN_SECONDS < 0:
     raise ValueError("CRAWL_WORKER_RUN_SECONDS 必须为非负整数")
 
 # 浏览器
-USER_AGENT = (
+USER_AGENT = os.environ.get("CRAWL_USER_AGENT", "").strip() or (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/150.0.0.0 Safari/537.36"
 )
-VIEWPORT = {"width": 1280, "height": 800}
+def _positive_viewport(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        raise ValueError(f"{name} 必须为正整数") from None
+    if value < 1:
+        raise ValueError(f"{name} 必须为正整数")
+    return value
+
+
+VIEWPORT = {
+    "width": _positive_viewport("CRAWL_VIEWPORT_WIDTH", 1280),
+    "height": _positive_viewport("CRAWL_VIEWPORT_HEIGHT", 800),
+}
+ELDORADO_USER_AGENT = os.environ.get("CRAWL_USER_AGENT", "").strip() or (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 # 浏览器引擎与运行模式（可用环境变量覆盖）
 #   BROWSER_CHANNEL: "chrome" 用系统真实 Chrome（反检测更强，需系统装 Chrome）；

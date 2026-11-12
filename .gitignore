@@ -20,3 +20,6 @@ debug_*.png
 .idea/
 logs/
 logs/
+
+# 独立监控进程锁
+.server_monitor.lock

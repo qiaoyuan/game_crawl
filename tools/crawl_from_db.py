@@ -1243,11 +1243,7 @@ async def iter_scheduled_targets(targets, total):
         # 等待可能被提前唤醒，重新核对到期时间，保证不提前抓取。
 
 
-ELDORADO_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+ELDORADO_USER_AGENT = config.ELDORADO_USER_AGENT
 ELDORADO_COOKIES = [
     {
         "name": name, "value": value, "domain": "www.eldorado.gg", "path": "/",

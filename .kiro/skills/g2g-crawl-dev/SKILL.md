@@ -115,3 +115,15 @@ rtk git diff --check
 `test_cleanup_logs.py` 覆盖压缩内容、原地截断后已有追加句柄继续写入、备份数量和过期清理、文件范围及符号链接排除、预览无日志修改、压缩落盘失败保留原日志，以及真实跨进程运行锁阻止清理。
 
 每次相关改动完成后按根目录 AGENTS.md 对照最终源码更新本 skill；独立工具变化另同步既有 CodeBuddy skill。替换过时约定，不写改动流水账、凭证或未经验证的部署状态。
+
+## 本机浏览器配置
+
+`g2g/config.py` 从当前环境文件读取 `CRAWL_USER_AGENT`、`CRAWL_VIEWPORT_WIDTH`、`CRAWL_VIEWPORT_HEIGHT`，系统环境变量优先。UA 未配置或空白时保留原平台默认值；非空时用于共享 G2G 配置及数据库入口 ELD 的 API 与 DOM。尺寸默认 1280×800，必须为正整数，只影响使用共享 VIEWPORT 的浏览器页面，不影响 API。配置在进程启动时读取，不自动轮换，不修改语言、计价、分片或调度，也不保证不同机器不能被关联。独立 ELD 工具不因此自动支持该 UA 配置。
+
+## 独立服务器监控
+
+Linux 独立监控进程读取 /proc 和系统负载，默认每10秒通过内网 MySQL 短连接写 server_monitor 和 server_monitor_history。使用 APP_ENV=prod 加载 .env.prod，系统环境变量优先。DB_HOST、DB_PORT、DB_USER、DB_PASSWORD、DB_NAME 复用爬虫配置。默认机器编号 crawler-<crawl_server>、名称爬虫<编号>，可用 SERVER_MONITOR_CODE、SERVER_MONITOR_NAME 显式覆盖，已有机器保留数据库名称。采集间隔和磁盘路径分别使用 SERVER_MONITOR_INTERVAL 和 SERVER_MONITOR_DISK_PATH。
+
+每个样本在同一事务中登记/锁定机器、去重、更新分钟计数/和/峰值及最新快照。last_report_at 使用数据库时间；重复或落后的采样跳过，过早/未来时间校验与 PHP 查询语义见后台 docs/server-monitor.md。失败时关闭连接，等下一轮新样本；日志记录错误类型和数字错误码。--dry-run 在 Linux 上只采一次，不连接数据库。
+
+监控由原生 crontab 每分钟用 flock 非阻塞拉起，每台一个常驻进程，独立 .server_monitor.lock 与爬虫运行锁分开。完整命令见 docs/server-monitor.md。

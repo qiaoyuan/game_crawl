@@ -88,3 +88,7 @@ python main.py reset    # 清除会话
 - **限流**: G2G 有请求频率限制，避免短时间内多次登录
 - **反检测**: 使用 `channel="chrome"` 启动真实 Chrome
 - **公开页面爬取**: 无需登录，直接 Playwright 打开页面提取数据
+
+## 本机浏览器配置
+
+`g2g/config.py` 从当前环境文件读取 `CRAWL_USER_AGENT`、`CRAWL_VIEWPORT_WIDTH`、`CRAWL_VIEWPORT_HEIGHT`，系统环境变量优先。UA 未配置或空白时保留原平台默认值；非空时用于共享 G2G 配置及数据库入口 ELD 的 API 与 DOM。尺寸默认 1280×800，必须为正整数，只影响使用共享 VIEWPORT 的浏览器页面，不影响 API。配置在进程启动时读取，不自动轮换，不修改语言、计价、分片或调度，也不保证不同机器不能被关联。独立 ELD 工具不因此自动支持该 UA 配置。
