@@ -138,11 +138,12 @@ class DealRateTests(unittest.IsolatedAsyncioTestCase):
 class PurchaseLimitTests(unittest.IsolatedAsyncioTestCase):
     async def test_limit_request_and_cached_route_are_independent(self):
         cache = {"listing": ({"id": "a"}, "A")}
-        payload = response(offer(price="42"), offer(price="28.9"))
+        payload = response(offer(singleprice="0.042", price="42"), offer(singleprice="0.0289", price="28.9"),
+                           offer(singleprice="0.035", price="35"))
         request = AsyncMock(return_value=payload)
         with (patch.object(dd373, "_get_json", request),
               patch.object(dd373.config, "DD373_FETCH_DEAL_RATES", False)):
-            for limit, prices in [(1, [42]), (0, [42, "28.9"]), (30, [42, "28.9"])]:
+            for limit, prices in [(1, [42]), (2, [42, "28.9"]), (0, [42, "28.9", 35]), (30, [42, "28.9", 35])]:
                 with self.subTest(limit=limit):
                     rows = await dd373.scrape_purchase_offers("listing", cache, limit=limit)
                     self.assertEqual([r["line_total"] for r in rows], [Decimal(p) for p in prices])

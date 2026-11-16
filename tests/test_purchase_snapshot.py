@@ -162,15 +162,17 @@ class PurchaseTransactionTests(unittest.TestCase):
         self.cursor.executemany.assert_not_called()
         self.connection.commit.assert_called_once()
 
-    def test_batch_uses_one_version_and_preserves_rmb_precision(self):
-        version = db.save_purchase_snapshot(purchase_target(), [purchase_row()], datetime.now())
+    def test_batch_preserves_offer_order_version_and_rmb_precision(self):
+        offers = [purchase_row(), dict(purchase_row(), price=Decimal("0.01875")),
+                  dict(purchase_row(), stock=1000)]
+        version = db.save_purchase_snapshot(purchase_target(), offers.copy(), datetime.now())
         self.assertEqual(version, 8)
         sql, rows = self.cursor.executemany.call_args.args
         columns = sql.split("(", 1)[1].split(")", 1)[0].replace(" ", "").replace("\n", "").split(",")
-        self.assertEqual(dict(zip(columns, rows[0], strict=True)), {
-            **purchase_row(), "target_id": 8, "game_product_id": 13, "version": 8,
+        self.assertEqual([dict(zip(columns, row, strict=True)) for row in rows], [{
+            **offer, "target_id": 8, "game_product_id": 13, "version": 8,
             "seller_name": "", "offer_url": "", "crawled_at": rows[0][-1],
-        })
+        } for offer in offers])
         self.connection.commit.assert_called_once()
         self.connection.close.assert_called_once()
 
