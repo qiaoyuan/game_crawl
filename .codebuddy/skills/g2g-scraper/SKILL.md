@@ -25,6 +25,7 @@ g2g/
 │   ├── scrape_g2g_products.py  # 爬取 G2G 产品卡片（无需登录，输出 JSON）
 │   ├── scrape_category.py      # 爬取 G2G 分类页商户（无需登录）
 │   ├── scrape_eldorado.py      # 爬取 Eldorado.gg 商户（无需登录）
+│   ├── update_boc_usd_rate.py  # 手动更新中行美元汇率
 │   ├── monitor_eldorado.py     # 连接已开启 CDP 的浏览器，监控当前订单详情及聊天
 │   ├── export_offers.py        # 导出 Offers（需登录）
 │   └── scrape_seller.py        # 爬取商户数据（需登录）
@@ -69,6 +70,10 @@ python -m tools.monitor_eldorado --chrome-auto-connect --output downloads/eldora
 ```
 先在已启用远程调试的 Chrome 中人工登录并打开订单详情。`--chrome-auto-connect` 通过 macOS Chrome 的 DevToolsActivePort 发现已有浏览器，连接时按提示允许；也可通过 `--cdp-url` 指定其他 Chromium 调试地址。每 3 秒读取首个匹配的 `/order/` 页面，可通过 `--interval` 和 CSS 选择器参数调整。程序不自动点击、刷新或遍历订单，首次读取和内容变化时向终端输出 JSON Lines，可选文件追加保存。聊天位于 TalkJS iframe，提取可见消息文本、绝对时间、方向及附件名称；结构不匹配时回退到可见文本。页面结构变化、虚拟滚动或尚未加载的内容可能影响结果。文件及终端输出含订单和对话信息，按敏感数据保管。
 
+### 手动更新中行美元汇率
+
+在项目根目录执行 `python -m tools.update_boc_usd_rate`，生产使用 `APP_ENV=prod venv/bin/python -m tools.update_boc_usd_rate`。每次通过 HTTPS 请求[中行外汇牌价](https://www.boc.cn/sourcedb/whpj/)，读取首条美元行的“现汇买入价”，用 Decimal 除以 100。复用项目数据库连接，以纯十进制文本写入 `admin_config.value`，配置名为 `usd_cny_rate`。依靠 `name` 唯一索引首次创建，后续只更新 `value` 和 `updated_at`。请求失败、无法定位报价或报价不是正数时，报错退出，保留原值。
+
 ### 导出 Offers（需登录会话）
 ```bash
 python main.py export
@@ -82,7 +87,7 @@ python main.py reset    # 清除会话
 
 ## 关键注意事项
 
-- **输出格式**: 抓取工具输出 JSON；订单监控输出 JSON Lines 到终端，可选追加到文件
+- **输出格式**: 商品和商户抓取工具输出 JSON；订单监控输出 JSON Lines；中行汇率工具写数据库并打印结果。
 - **会话持久化**: `session.json` 保存登录态，后续运行无需重新登录
 - **OTP 验证**: 登录时需邮箱 OTP，脚本提示用户手动输入
 - **限流**: G2G 有请求频率限制，避免短时间内多次登录

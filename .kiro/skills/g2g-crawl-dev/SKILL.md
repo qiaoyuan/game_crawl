@@ -11,6 +11,7 @@ description: 维护本项目 G2G/ELD 竞品及 DD373 收货数据库任务爬虫
 - Python 按 `crawl_target.task_type` 分流。竞品保存到 `crawl_data` 并发送 `crawl_notify`，实际改价由 PHP 后台的 `price:strategy:consume` 执行。收货只保存到 `purchase_data`，供后台按产品 ID 和版本查看。
 - 关联后台项目为 `/Users/qiaoyuan/www/php/base_admin`。后台旧手工 `CrawlService` 写 `competitor_product`，不是此生产链路。
 - 独立抓取、登录与导出工具另见项目 `.codebuddy/skills/g2g-scraper/SKILL.md`，不要把其 JSON 输出规则套到数据库入口。
+- 中行美元汇率由独立命令 `python -m tools.update_boc_usd_rate` 按次更新 `admin_config` 中的 `usd_cny_rate`，复用项目数据库配置；执行方式和取价规则见上述独立工具规范。
 
 ## 配置与抓取范围
 
