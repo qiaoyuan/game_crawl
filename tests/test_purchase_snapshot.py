@@ -11,8 +11,8 @@ from tools import crawl_from_db
 
 def purchase_target():
     return {"id": 8, "game_product_id": 13, "task_type": "1", "version": 7,
-            "url": "https://www.dd373.com/s-example.html",
-            "category": "游戏币", "crawl_type": 1}
+            "url": "https://www.dd373.com/s-game-c-coin-realm.html",
+            "category": "物品", "crawl_type": 1}
 
 
 def purchase_row():
@@ -26,7 +26,8 @@ class PurchaseRouteTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.scrape_offers = crawl_from_db.dd373.scrape_purchase_offers
         self.source = stack.enter_context(patch.object(
             crawl_from_db.dd373, "scrape_purchase_offers", new_callable=AsyncMock,
         ))
@@ -43,15 +44,18 @@ class PurchaseRouteTests(unittest.IsolatedAsyncioTestCase):
         self.no_driver.assert_not_called()
 
     async def test_purchase_route_isolated_from_competitor_workflow(self):
-        target = purchase_target()
         self.source.return_value = [purchase_row()]
         self.database.save_purchase_snapshot.return_value = 8
-        saved, failed, wall, _ = await crawl_from_db.crawl_target(self.session, 0, target, 1)
-        self.assertEqual((saved, failed, target["version"]), (1, False, 8))
-        self.source.assert_awaited_once_with(target["url"], route_cache=self.session.dd373_routes)
-        self.database.save_purchase_snapshot.assert_called_once_with(
-            target, self.source.return_value, datetime.fromtimestamp(wall).replace(microsecond=0),
-        )
+        for task_type in (1, "1"):
+            with self.subTest(task_type=task_type):
+                target = dict(purchase_target(), task_type=task_type)
+                saved, failed, wall, _ = await crawl_from_db.crawl_target(self.session, 0, target, 1)
+                self.assertEqual((saved, failed, target["version"]), (1, False, 8))
+                self.source.assert_awaited_with(target["url"], route_cache=self.session.dd373_routes)
+                self.database.save_purchase_snapshot.assert_called_with(
+                    target, self.source.return_value, datetime.fromtimestamp(wall).replace(microsecond=0),
+                )
+                self.assertIn("task_type=1（收货）", self.output.getvalue())
 
     async def test_failed_fetch_leaves_no_snapshot(self):
         self.source.side_effect = RuntimeError("取价失败")
@@ -76,13 +80,51 @@ class PurchaseRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNot(first, self.source.await_args.kwargs["route_cache"])
 
     async def test_misconfigured_targets_cannot_use_competitor_pipeline(self):
-        for task_type in ("2", "unknown", 0):
-            target = dict(purchase_target(), task_type=task_type)
-            with self.subTest(task_type=task_type):
+        dd373_url = purchase_target()["url"]
+        g2g_url = "https://www.g2g.com/example"
+        for task_type, category, url in (
+            (0, "物品", dd373_url), ("0", "DD373游戏币", g2g_url),
+            (2, "物品", g2g_url), ("unknown", "物品", g2g_url),
+        ):
+            target = dict(purchase_target(), task_type=task_type, category=category, url=url)
+            with self.subTest(task_type=task_type, category=category, url=url):
                 result = await crawl_from_db.crawl_target(self.session, 0, target, 1)
                 self.assertEqual(result, (0, True, None, None))
         self.source.assert_not_awaited()
         self.database.save_purchase_snapshot.assert_not_called()
+
+    async def test_purchase_with_g2g_url_rejects_configuration_without_network_or_browser(self):
+        self.source.side_effect = self.scrape_offers
+        target = dict(purchase_target(), url="https://www.g2g.com/example")
+        with patch.object(crawl_from_db.dd373, "_get_json", new_callable=AsyncMock) as request:
+            result = await crawl_from_db.crawl_target(self.session, 0, target, 1)
+        self.assertEqual(result, (0, True, None, None))
+        self.assertIn("task_type=1（收货）", self.output.getvalue())
+        self.assertIn("DD373 普通商品列表原始链接", self.output.getvalue())
+        self.source.assert_awaited_once_with(target["url"], route_cache=self.session.dd373_routes)
+        request.assert_not_awaited()
+        self.database.save_purchase_snapshot.assert_not_called()
+
+
+class CompetitorRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_zero_and_legacy_targets_keep_competitor_collection_and_notification(self):
+        for fields in ({"task_type": 0}, {"task_type": "0"}, {}):
+            with self.subTest(fields=fields), patch.object(crawl_from_db, "db") as database:
+                target = {"id": 5, "game_product_id": 13, "category": "物品",
+                          "url": "https://www.g2g.com/example", **fields}
+                session = AsyncMock()
+                database.increment_version.return_value = 4
+                database.save_crawl_data.return_value = 1
+                items = [{"price": "0.12", "currency": "USD"}]
+                with patch.object(crawl_from_db, "scrape_page", return_value=items) as scrape, \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    result = await crawl_from_db.crawl_target(session, 0, target, 1)
+                self.assertEqual(result[:2], (1, False))
+                self.assertIn("task_type=0（竞品）", output.getvalue())
+                scrape.assert_awaited_once_with(session.get_g2g_page.return_value, target["url"])
+                database.save_crawl_data.assert_called_once_with(5, "g2g", items, game_product_id=13, version=4)
+                database.insert_crawl_notify.assert_called_once_with(5, 4, 1)
+                database.save_purchase_snapshot.assert_not_called()
 
 
 class PurchaseTransactionTests(unittest.TestCase):
