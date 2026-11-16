@@ -1526,10 +1526,15 @@ async def crawl_target(session, idx, target, total):
     used_g2g_page = False
     try:
         if task_type == "1":
+            limit = target.get("limit", 0)
+            if isinstance(limit, str) and limit.isascii() and limit.isdecimal():
+                limit = int(limit)
+            if type(limit) is not int or limit < 0:
+                raise ValueError("收货 limit 必须为非负整数")
             started_wall, started_mono = time.time(), monotonic()
             crawl_started_at = datetime.fromtimestamp(started_wall).replace(microsecond=0)
             with timed_stage("DD373 收货报价"):
-                items = await dd373.scrape_purchase_offers(url, route_cache=session.dd373_routes)
+                items = await dd373.scrape_purchase_offers(url, route_cache=session.dd373_routes, limit=limit)
             version = db.save_purchase_snapshot(target, items, crawl_started_at)
             target["version"] = version  # 短间隔任务可能在下一次元数据刷新前再次执行。
             print(f"  -> 收货快照完成: version={version}，新增 {len(items)} 条，"

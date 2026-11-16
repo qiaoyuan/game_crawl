@@ -106,16 +106,20 @@ def save_purchase_snapshot(target: dict, items: list, started_at: datetime) -> i
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE crawl_target SET version = %s, last_crawl_at = %s
+                SELECT * FROM crawl_target
                 WHERE id = %s AND COALESCE(version, 0) = %s AND task_type = 1
                   AND game_product_id = %s AND BINARY url = %s AND crawl_server = %s
                   AND status = 1 AND deleted_at IS NULL
+                FOR UPDATE
                 """,
-                (version, started_at, target_id, previous_version,
-                 product_id, target["url"], config.CRAWL_SERVER),
+                (target_id, previous_version, product_id, target["url"], config.CRAWL_SERVER),
             )
-            if cur.rowcount != 1:
+            # 旧表没有 limit。锁定后读当前值，避免期间加列或调整上限时提交旧快照。
+            current = cur.fetchone()
+            if current is None or int(current.get("limit", 0)) != int(target.get("limit", 0)):
                 raise RuntimeError("收货任务配置或版本已变更，丢弃本轮结果")
+            cur.execute("UPDATE crawl_target SET version = %s, last_crawl_at = %s WHERE id = %s",
+                        (version, started_at, target_id))
             if items:
                 cur.executemany(
                     """

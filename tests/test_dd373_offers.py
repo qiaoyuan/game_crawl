@@ -133,3 +133,46 @@ class DealRateTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(dd373.requests, "get", side_effect=dd373.requests.Timeout):
             await dd373._add_deal_rates("listing", [row], quotes)
         self.assertEqual(quotes, dd373.parse_shop_offers(response(row), "测试"))
+
+
+class PurchaseLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_limit_request_and_cached_route_are_independent(self):
+        cache = {"listing": ({"id": "a"}, "A")}
+        payload = response(offer(price="42"), offer(price="28.9"))
+        request = AsyncMock(return_value=payload)
+        with (patch.object(dd373, "_get_json", request),
+              patch.object(dd373.config, "DD373_FETCH_DEAL_RATES", False)):
+            for limit, prices in [(1, [42]), (0, [42, "28.9"]), (30, [42, "28.9"])]:
+                with self.subTest(limit=limit):
+                    rows = await dd373.scrape_purchase_offers("listing", cache, limit=limit)
+                    self.assertEqual([r["line_total"] for r in rows], [Decimal(p) for p in prices])
+                    params = {"id": "a", "limit": limit} if limit else {"id": "a"}
+                    request.assert_awaited_with(dd373.SHOP_LIST_API, params)
+        self.assertEqual(cache["listing"][0], {"id": "a"})
+
+    async def test_only_parse_and_enrich_selected_offers_but_check_all_ids(self):
+        selected = [offer(shopno="duplicate"), offer(shopno="unique")]
+        trailing = [None, {"shopno": "duplicate"}, offer(shopno="outside", price="broken")]
+        request = AsyncMock(return_value=response(*selected, *trailing))
+        cache = {"listing": ({}, "A")}
+        with (patch.object(dd373, "_get_json", request),
+              patch.object(dd373.config, "DD373_FETCH_DEAL_RATES", True),
+              patch.object(dd373, "_fetch_deal_rates", return_value={"unique": Decimal(95)}) as fetch):
+            rows = await dd373.scrape_purchase_offers("listing", cache, limit=2)
+            self.assertEqual([row["deal_rate"] for row in rows], [None, Decimal(95)])
+            fetch.assert_called_once_with("listing", {"unique"})
+            with self.assertRaises(ValueError):
+                await dd373.scrape_purchase_offers("listing", cache, limit=3)
+
+    async def test_empty_success_and_invalid_limits(self):
+        request = AsyncMock(return_value=response())
+        with (patch.object(dd373, "_get_json", request),
+              patch.object(dd373.config, "DD373_FETCH_DEAL_RATES", True),
+              patch.object(dd373, "_fetch_deal_rates") as fetch):
+            for limit in (-1, True, 1.5, "2"):
+                with self.subTest(limit=limit), self.assertRaises(ValueError):
+                    await dd373.scrape_purchase_offers("listing", limit=limit)
+            request.assert_not_awaited()
+            rows = await dd373.scrape_purchase_offers("listing", {"listing": ({}, "A")}, limit=5)
+            self.assertEqual(rows, [])
+            fetch.assert_not_called()

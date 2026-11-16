@@ -43,10 +43,12 @@ def _positive_amount(row, field):
     return value
 
 
-def parse_shop_offers(payload, region):
+def parse_shop_offers(payload, region, *, limit=0):
     rows = dd373_result(payload)
     if not isinstance(rows, list):
         raise ValueError("DD373 缺少商品列表")
+    if limit > 0:
+        rows = rows[:limit]
     offers = []
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("unit"), str) or not row["unit"].strip():
@@ -74,7 +76,7 @@ def parse_shop_offers(payload, region):
     return offers
 
 
-def _parse_deal_rates(html):
+def _parse_deal_rates(html, wanted=None):
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.get_text(strip=True) if soup.title else ""
     if re.search(r"登录|安全验证|人机验证|verify|captcha", title, flags=re.I):
@@ -84,6 +86,8 @@ def _parse_deal_rates(html):
     rates = {}
     for button in soup.select('div.border-box > div.shop-btn-group[id^="buyButton"]'):
         shopno = button["id"][len("buyButton"):]
+        if wanted is not None and shopno not in wanted:
+            continue
         row = button.parent
         if shopno in rates or len(row.select(':scope > div.shop-btn-group[id^="buyButton"]')) != 1:
             rates[shopno] = None
@@ -102,23 +106,29 @@ def _parse_deal_rates(html):
     return rates
 
 
-def _fetch_deal_rates(url):
+def _fetch_deal_rates(url, wanted):
     with requests.get(
         url, headers={"Accept": "text/html", "Cache-Control": "no-cache"},
         timeout=(5, 15), allow_redirects=False,
     ) as response:
         if response.status_code != 200 or "text/html" not in response.headers.get("Content-Type", "").lower():
             return {}
-        return _parse_deal_rates(response.content)
+        return _parse_deal_rates(response.content, wanted)
 
 
 async def _add_deal_rates(url, source_rows, offers):
     try:
-        rates = await asyncio.to_thread(_fetch_deal_rates, url)
-        shopnos = [row.get("shopno") if isinstance(row.get("shopno"), str) else None for row in source_rows]
+        # 唯一性按整份响应核对。截取范围外的行仅读取商品编号。
+        shopnos = []
+        for row in source_rows:
+            shopno = row.get("shopno") if isinstance(row, dict) else None
+            shopnos.append(shopno if isinstance(shopno, str) else None)
         counts = Counter(shopnos)
-        for shopno, offer in zip(shopnos, offers):
-            if shopno and counts[shopno] == 1:
+        selected = shopnos[:len(offers)]
+        wanted = {shopno for shopno in selected if shopno and counts[shopno] == 1}
+        rates = await asyncio.to_thread(_fetch_deal_rates, url, wanted) if wanted else {}
+        for shopno, offer in zip(selected, offers):
+            if shopno in wanted:
                 offer["deal_rate"] = rates.get(shopno)
     except Exception as exc:
         print(f"[!] DD373 成交率页面不可用（{type(exc).__name__}），保留 API 报价", flush=True)
@@ -127,15 +137,20 @@ async def _add_deal_rates(url, source_rows, offers):
     print(f"[*] DD373 成交率匹配 {matched}/{len(offers)} 条", flush=True)
 
 
-async def scrape_purchase_offers(url, route_cache=None):
+async def scrape_purchase_offers(url, route_cache=None, limit=0):
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError("收货 limit 必须为非负整数")
     if route_cache is not None and url in route_cache:
         params, region = route_cache[url]
     else:
         params, region = await resolve_dd373_route(url, _get_json)
         if route_cache is not None:
             route_cache[url] = (params, region)
+    if limit > 0:
+        params = {**params, "limit": limit}
     payload = await _get_json(SHOP_LIST_API, params)
-    offers = parse_shop_offers(payload, region)
+    # 平台可能返回更多报价，按原序在解析单价、库存之前应用任务上限。
+    offers = parse_shop_offers(payload, region, limit=limit)
     if config.DD373_FETCH_DEAL_RATES and offers:
         await _add_deal_rates(url, dd373_result(payload), offers)
     return offers

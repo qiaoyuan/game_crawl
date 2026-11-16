@@ -41,11 +41,12 @@ description: 维护本项目 G2G/ELD 竞品及 DD373 收货数据库任务爬虫
 ## DD373 收货数据
 
 - 任务用途 `task_type` 与竞品的加强选项 `crawl_type` 独立。用途 0 为竞品（旧记录迁移默认值；Python 兼容缺少字段的旧数据），1 为收货，两者支持数字字符串；未知值报错。每个目标的开始日志同时打印 target_id、game_product_id、task_type 的值和中文用途、category。后台同一产品可分别绑定一个未删除的竞品任务和一个收货任务。收货优先按任务用途进入 DD373 报价入口，即使旧分类写了「物品」也只验证 DD373 列表链接。竞品任务若带 DD373 分类或 DD373 域名，会在递增版本和启动浏览器前报配置错误。收货走同一服务器分片和调度，跳过竞品店铺过滤、加强、策略及改价通知。
-- 收货链接采用 `https://www.dd373.com/s-<游戏>-c-<商品类型>-<区服层级...>.html`，要求具体区服且没有查询参数或片段。根据 [DD373 官方游戏目录](https://kf.dd373.com/helpdetail/e5675fb48f6a42e4a59ae5712b132965.html) 取得游戏、游戏币类型与各层级的 ID 和名称，按父级和短码逐级核对，末级须无下属区服；名称以目录为准。用 GameId、GameOtherId（按顺序以下划线拼接）及 GameShopTypeId 匿名查询 [普通商品比例接口](https://kf.dd373.com/helpdetail/dc862c7b70d74880968d2386e544b5bf.html) 的 `ApiGetShopList`。采集的是站内「立即购买」卖方报价，适用于后台核算收货成本。每个 worker 在当前运行窗口按完整 URL 复用已核实的目录映射；不同 URL 分开解析，退出时释放。报价和可选成交率每轮重新请求，保存报价接口本次返回的完整列表，不翻页。使用标准 HTTP 请求，无需 Cookie、Playwright driver、浏览器或页面。
+- 收货链接采用 `https://www.dd373.com/s-<游戏>-c-<商品类型>-<区服层级...>.html`，要求具体区服且没有查询参数或片段。根据 [DD373 官方游戏目录](https://kf.dd373.com/helpdetail/e5675fb48f6a42e4a59ae5712b132965.html) 取得游戏、游戏币类型与各层级的 ID 和名称，按父级和短码逐级核对，末级须无下属区服；名称以目录为准。用 GameId、GameOtherId（按顺序以下划线拼接）及 GameShopTypeId 匿名查询 [普通商品比例接口](https://kf.dd373.com/helpdetail/dc862c7b70d74880968d2386e544b5bf.html) 的 `ApiGetShopList`。采集的是站内「立即购买」卖方报价，适用于后台核算收货成本。每个 worker 在当前运行窗口按完整 URL 复用已核实的目录映射；不同 URL 分开解析，退出时释放。报价每轮通过标准 HTTP 请求读取一次，不翻页，无需 Cookie 或浏览器。
+- 每个收货任务单独设置 `crawl_target.limit`，默认 0。0 或旧表缺列时省略请求参数，处理接口本轮返回的全部报价。正数 N 作为 `limit` 传给商品接口，并按响应原序取前 N 条再解析和保存。平台可能忽略请求参数，实际入库上限由 worker 保证。上限只用于本轮报价请求，不写入目录缓存。
 - `sales_unit` 为 1 个接口单位（如 1 万基纳），`price` 取 singleprice 的人民币单价；`line_quantity` 取每件数量 amount，`line_total` 取接口整件人民币价格 price；库存 `stock = number × amount`，库存人民币金额 `line_stock_amount = number × price`，按分四舍五入。使用 Decimal。接口缺少成交率、店铺名和详情链接，默认分别保存 NULL、空串、空串。
-- 启用 `DD373_FETCH_DEAL_RATES` 后，有报价时额外匿名 GET 当前列表一次，按网页行的商品编号与 API 的 shopno 匹配，仅读取同一行显示的成交率。HTML 中有成交率且唯一匹配才写入；未展示、无匹配、网页不可用或要求验证时保留 NULL，由后台显示为「—」。网页只能补全当页可匹配的商品，不能扩大 API 的报价范围或覆盖价格库存。
-- 抓取成功后在一个事务内推进目标版本、写本轮开始时间、插入该产品与版本的全部收货行。提交前按原版本、产品、URL、本机服务器、收货用途和启用/未删除状态核对目标。竞争写入、任务条件改变、写入或解析失败均不提交本批；接口双重成功且明确返回空数组时可提交零行版本。目录或报价 API 的 HTTP 或 JSON 失败不回退网页。
-- 现有数据库由关联后台迁移：先执行 `sql/alter_crawl_target_add_task_type.sql`（原库已有 active_game_product_id 及唯一索引），再执行 `sql/purchase_data.sql`，部署支持用途分流的 worker 后再启用收货任务。后台菜单与角色按后台权限同步规范处理。
+- 启用 `DD373_FETCH_DEAL_RATES` 后，入选报价有可匹配商品编号时额外匿名 GET 当前列表一次。商品编号须在完整的 API 响应中唯一，再按入选商品的 shopno 匹配网页行，仅读取同一行显示的成交率。HTML 中有成交率且唯一匹配才写入；未展示、无匹配、网页不可用或要求验证时保留 NULL，由后台显示为「—」。网页只能补全当页可匹配的商品，不能扩大 API 的报价范围或覆盖价格库存。
+- 抓取成功后在一个事务内推进目标版本、写本轮开始时间、插入该产品与版本的全部收货行。提交前锁定目标行，核对原版本、产品、URL、本机服务器、收货用途、条数上限和启用/未删除状态。竞争写入、任务条件改变、写入或解析失败均不提交本批；接口双重成功且明确返回空数组时可提交零行版本。目录或报价 API 的 HTTP 或 JSON 失败不回退网页。
+- 现有数据库由关联后台迁移：先执行 `sql/alter_crawl_target_add_task_type.sql`（原库已有 active_game_product_id 及唯一索引），再执行 `sql/purchase_data.sql`，部署支持用途分流的 worker 后再启用收货任务。已有收货表的数据库执行后台 `sql/alter_crawl_target_add_limit.sql` 后即可为任务配置条数。已有任务默认 0，无需新增环境变量。后台菜单与角色按后台权限同步规范处理。
 
 ## 任务、分片与快照
 
