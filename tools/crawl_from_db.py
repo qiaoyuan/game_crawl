@@ -1,5 +1,5 @@
 """
-从数据库 crawl_target 表读取 URL 列表，批量爬取并保存到 crawl_data 表
+从 crawl_target 读取任务，将竞品和收货快照分别写入 crawl_data 和 purchase_data
 用法: python -m tools.crawl_from_db
 生产独立调度: bash run_crawl_and_consume.sh（进程数读取 CRAWL_WORKER_COUNT）
 单轮分片: python -m tools.crawl_from_db --worker-count 2 --worker-index 0
@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from time import monotonic, perf_counter
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
-from g2g import config, db
+from g2g import config, db, dd373
 from g2g.coin_detail import parse_coin_detail
 from g2g.coin_offers import G2G_COIN_PAGE_SIZE, CoinApiUnavailable, parse_coin_offers
 from g2g.crawl_filter import compile_policies, identifiers, number, select_top3
@@ -1268,6 +1268,7 @@ class CrawlSession:
         self.browser_cleanup_pending = False
         self.eldorado_request = None
         self.g2g_request = None
+        self.dd373_routes = {}
 
     async def __aenter__(self):
         await self.resources.__aenter__()
@@ -1277,6 +1278,7 @@ class CrawlSession:
         try:
             await self._close_browser()
         finally:
+            self.dd373_routes.clear()
             # 即使关闭期间被取消，也继续释放 request / Playwright driver。
             result = await self.resources.__aexit__(*args)
         return result
@@ -1522,6 +1524,21 @@ async def crawl_target(session, idx, target, total):
     inserted = 0
     used_g2g_page = False
     try:
+        task_type = target.get("task_type", 0)
+        if task_type in (1, "1"):
+            started_wall, started_mono = time.time(), monotonic()
+            crawl_started_at = datetime.fromtimestamp(started_wall).replace(microsecond=0)
+            with timed_stage("DD373 收货报价"):
+                items = await dd373.scrape_purchase_offers(url, route_cache=session.dd373_routes)
+            version = db.save_purchase_snapshot(target, items, crawl_started_at)
+            target["version"] = version  # 短间隔任务可能在下一次元数据刷新前再次执行。
+            print(f"  -> 收货快照完成: version={version}，新增 {len(items)} 条，"
+                  f"耗时 {perf_counter() - target_started:.2f} 秒", flush=True)
+            return len(items), False, started_wall, started_mono
+        if task_type not in (0, "0"):
+            raise ValueError(f"未知任务类型: {task_type}")
+        if urlsplit(url).hostname in {"dd373.com", "www.dd373.com"}:
+            raise ValueError("DD373 收货链接须配置为收货任务")
         # 1 优先按绑定店铺加强，空名单按策略 Top3 加强；均保存全部候选。
         crawl_type = target.get("crawl_type") or 0
         enhance_enabled = crawl_type in (1, "1", "top3")

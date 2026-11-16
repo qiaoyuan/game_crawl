@@ -62,6 +62,9 @@ ELD_OFFER_PAGE_SIZE = int(os.environ.get("ELD_OFFER_PAGE_SIZE", "8"))
 if ELD_OFFER_PAGE_SIZE < 1:
     raise ValueError("ELD_OFFER_PAGE_SIZE 必须为正整数")
 
+# DD373 报价走官方 API。可选匿名读取商品列表 HTML，按商品编号补全成交率。
+DD373_FETCH_DEAL_RATES = os.environ.get("DD373_FETCH_DEAL_RATES", "0").strip().lower() in ("1", "true", "yes")
+
 # 全局排除店铺：在加强选择、价格处理和入库前跳过，支持逗号分隔多个名字。
 CRAWL_EXCLUDE_STORES = os.environ.get("CRAWL_EXCLUDE_STORES", "")
 

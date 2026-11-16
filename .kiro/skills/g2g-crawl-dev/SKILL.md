@@ -1,6 +1,6 @@
 ---
 name: g2g-crawl-dev
-description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、店铺加强、数据快照、PHP 改价通知和 Linux 启动脚本；修改相关源码或排查抓取停滞、价格错误、进程重叠时使用。
+description: 维护本项目 G2G/ELD 竞品及 DD373 收货数据库任务爬虫的配置、分片、店铺加强、数据快照、PHP 改价通知和 Linux 启动脚本；修改相关源码或排查抓取停滞、价格错误、进程重叠时使用。
 ---
 
 # 数据库任务爬虫规范
@@ -8,7 +8,7 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 ## 入口与职责
 
 - `tools/crawl_from_db.py` 是生产入口，其中 `CrawlSession` 按需管理 worker 的请求和浏览器资源；`g2g/db.py` 负责数据库读写，`g2g/crawl_filter.py` 决定空加强名单时的 Top3 对象。
-- Python 抓取 `crawl_target`，保存 `crawl_data`，发送 `crawl_notify`；实际改价由 PHP 后台的 `price:strategy:consume` 执行。Python 不执行竞价或改价。
+- Python 按 `crawl_target.task_type` 分流。竞品保存到 `crawl_data` 并发送 `crawl_notify`，实际改价由 PHP 后台的 `price:strategy:consume` 执行。收货只保存到 `purchase_data`，供后台按产品 ID 和版本查看。
 - 关联后台项目为 `/Users/qiaoyuan/www/php/base_admin`。后台旧手工 `CrawlService` 写 `competitor_product`，不是此生产链路。
 - 独立抓取、登录与导出工具另见项目 `.codebuddy/skills/g2g-scraper/SKILL.md`，不要把其 JSON 输出规则套到数据库入口。
 
@@ -21,6 +21,7 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 | `crawl_server` | 1 | 允许任意正整数，本机只读取对应服务器编号的任务 |
 | `CRAWL_OFFER_LIMIT` | 10 | G2G 正整数上限。游戏币在第一页排除店铺后最多保存 min(N,10) 条；其他分类取页面前 N 条 |
 | `ELD_OFFER_PAGE_SIZE` | 8 | ELD 保存条数上限，正整数；API 固定请求 150 条，DOM 兜底仍用作页面截取上限 |
+| `DD373_FETCH_DEAL_RATES` | 0 | 1/true/yes 时额外读取一次普通商品列表 HTML 并按商品编号补成交率，默认仅使用 API |
 | `CRAWL_EXCLUDE_STORES` | 空字符串 | 全局排除多个店铺名/卖家标识，排除价格处理、加强和入库 |
 | `CRAWL_WORKER_COUNT` | 1 | 启动脚本的 worker 数，可在 `.env.prod` 中配置，系统环境变量优先 |
 | `CRAWL_WORKER_RUN_SECONDS` | 300 | `--scheduled` 的调度软窗口秒数，非负整数；0 回退单轮 |
@@ -37,6 +38,15 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 - `CRAWL_EXCLUDE_STORES` 与其他 Python 配置一样由 `.env`/`.env.prod` 加载，系统环境变量优先；未配置或空值不排除。支持英文/中文逗号、换行及 JSON 数组，复用 identifiers 归一化大小写、HTML 实体和空白，对 seller_id/seller_name 完整匹配，不按子串命中。生产两台服务器需各自配置，上线模板不代表真实环境已同步。
 - G2G 通用卡片路径与 ELD DOM 先取得当前页面前 N 条，在 Python 价格/好评率处理之前过滤全局名单，不向页面上限外补抓；ELD API 在本批前 150 条中识别卖家身份后立即排除，再换算报价、排序并截取最低 N 条。被排除行不进入 Top3/绑定店铺加强，也不进入 crawl_data；加强名单与策略白名单不能覆盖全局排除。有效候选不足时保存和通知实际条数，API 本批全部被排除时成功返回空列表，不回退 DOM 或翻页。
 
+## DD373 收货数据
+
+- 任务用途 `task_type` 与竞品的加强选项 `crawl_type` 独立。用途 0 为竞品（旧记录迁移默认值；Python 兼容缺少字段的旧数据），1 为收货，两者支持数字字符串；未知值报错。后台同一产品可分别绑定一个未删除的竞品任务和一个收货任务。收货走同一服务器分片和调度，跳过竞品店铺过滤、加强、策略及改价通知。
+- 收货链接采用 `https://www.dd373.com/s-<游戏>-c-<商品类型>-<区服层级...>.html`，要求具体区服且没有查询参数或片段。根据 [DD373 官方游戏目录](https://kf.dd373.com/helpdetail/e5675fb48f6a42e4a59ae5712b132965.html) 取得游戏、游戏币类型与各层级的 ID 和名称，按父级和短码逐级核对，末级须无下属区服；名称以目录为准。用 GameId、GameOtherId（按顺序以下划线拼接）及 GameShopTypeId 匿名查询 [普通商品比例接口](https://kf.dd373.com/helpdetail/dc862c7b70d74880968d2386e544b5bf.html) 的 `ApiGetShopList`。采集的是站内「立即购买」卖方报价，适用于后台核算收货成本。每个 worker 在当前运行窗口按完整 URL 复用已核实的目录映射；不同 URL 分开解析，退出时释放。报价和可选成交率每轮重新请求，保存报价接口本次返回的完整列表，不翻页。使用标准 HTTP 请求，无需 Cookie、Playwright driver、浏览器或页面。
+- `sales_unit` 为 1 个接口单位（如 1 万基纳），`price` 取 singleprice 的人民币单价；`line_quantity` 取每件数量 amount，`line_total` 取接口整件人民币价格 price；库存 `stock = number × amount`，库存人民币金额 `line_stock_amount = number × price`，按分四舍五入。使用 Decimal。接口缺少成交率、店铺名和详情链接，默认分别保存 NULL、空串、空串。
+- 启用 `DD373_FETCH_DEAL_RATES` 后，有报价时额外匿名 GET 当前列表一次，按网页行的商品编号与 API 的 shopno 匹配，仅读取同一行显示的成交率。HTML 中有成交率且唯一匹配才写入；未展示、无匹配、网页不可用或要求验证时保留 NULL，由后台显示为「—」。网页只能补全当页可匹配的商品，不能扩大 API 的报价范围或覆盖价格库存。
+- 抓取成功后在一个事务内推进目标版本、写本轮开始时间、插入该产品与版本的全部收货行。提交前按原版本、产品、URL、本机服务器、收货用途和启用/未删除状态核对目标。竞争写入、任务条件改变、写入或解析失败均不提交本批；接口双重成功且明确返回空数组时可提交零行版本。目录或报价 API 的 HTTP 或 JSON 失败不回退网页。
+- 现有数据库由关联后台迁移：先执行 `sql/alter_crawl_target_add_task_type.sql`（原库已有 active_game_product_id 及唯一索引），再执行 `sql/purchase_data.sql`，部署支持用途分流的 worker 后再启用收货任务。后台菜单与角色按后台权限同步规范处理。
+
 ## 任务、分片与快照
 
 - 新增爬虫服务器编号时，不能只修改服务器 `.env.prod` 的 `crawl_server`：Python 的 `g2g/config.py` 仅校验正整数，不维护编号枚举，新增编号无需修改 Python 校验；验证新增编号能正常加载。核对关联 PHP 后台 `CrawlTarget` 模型的服务器常量、映射、选项，验证器允许值，以及 `Crawl` 控制器的统计分组是否支持新编号；涉及后台修改时先读取其项目规范。部署更新后的代码，在新服务器配置对应编号，并将目标任务分配给该编号；克隆服务器不会自动转移数据库任务。系统环境变量可能覆盖文件配置，排查时一并检查。`CRAWL_WORKER_COUNT` 是本机工作进程数，不是服务器编号。
@@ -47,9 +57,9 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 - 驻留模式窗口、刷新、失败退避使用单调时钟；业务开始时间继续按原秒精度写数据库。抓取失败不更新 `last_crawl_at`；目标错误按完成时刻退避 30 秒后可重试，期间继续处理其他到期任务，失败退避仅在本窗口内有效。有失败的窗口汇总返回非零。窗口时间到后停止领取新目标，已开始目标正常完成再释放资源；不是硬超时，不强杀正在抓取或保存的任务。当前数据库连接无显式读写超时，不能宣称窗口必定在 300 秒内结束。
 - 直接 `python -m tools.crawl_from_db` 仍为单轮；`--scheduled` 配合 `CRAWL_WORKER_RUN_SECONDS=0` 也回退单轮。单轮的 `iter_scheduled_targets` 保留兼容行为：先执行本轮已到期目标，同时到期按原 ID；队列无到期目标时等最近到期者，剩余不超过 30 秒则 sleep 后重新检查，否则跳过剩余队列。每个目标单轮最多尝试一次，等待阈值不是整轮耗时上限。历史完成时间无需迁移，首个成功轮次后自然换成开始时间。
 - `crawl_type`：0 默认，1 店铺加强；兼容数字字符串、历史 `default/top3`，缺失/空值按 0，未知类型报错。
-- 每个目标抓取前递增 `crawl_target.version`，本轮所有 `crawl_data` 带同一 `target_id`、`game_product_id` 和 version。加强失败仍可能已递增版本。
-- 成功顺序：保存完整候选 → 更新 `last_crawl_at` → 插入 `crawl_notify(status=0)`，通知带目标、准确 version、实际保存条数。成功零条也可发零条通知。PHP 按通知 version 读取快照，不能只读最新版本。
-- 这些数据库步骤当前分别提交，不能宣称数据保存、时间更新和通知是一个原子事务。目标异常会记录失败并继续后续目标；有失败时本轮返回非零。
+- 竞品目标抓取前递增 `crawl_target.version`，本轮所有 `crawl_data` 带同一 `target_id`、`game_product_id` 和 version。加强失败仍可能已递增版本。
+- 竞品成功顺序：保存完整候选 → 更新 `last_crawl_at` → 插入 `crawl_notify(status=0)`，通知带目标、准确 version、实际保存条数。成功零条也可发零条通知。PHP 按通知 version 读取快照，不能只读最新版本。
+- 以上竞品数据库步骤当前分别提交，不能宣称数据保存、时间更新和通知是一个原子事务。目标异常会记录失败并继续后续目标；有失败时本轮返回非零。
 
 ## G2G 店铺加强：一轮任务如何完成
 
@@ -88,7 +98,7 @@ description: 维护本项目 G2G/ELD 数据库任务爬虫的配置、分片、�
 - 脚本用 `logs/crawl.lock` 的 flock 防止同一脚本重叠，先非阻塞尝试；上一轮仍运行时使用 `flock -w 30` 最多等锁 30 秒，上一轮退出后本次立即执行。等锁超时记日志并返回 0；锁本身报错记录并返回非零。额外用 `logs/crawl_wait.lock` 的非阻塞锁限制最多一个等锁触发，重复触发已有等待者时记日志后退出；取得运行锁后立即关闭等待锁 fd，再启动 workers，子进程仅继承运行锁。两种锁文件均不可在运行/等待期间删除，否则不同 inode 会破坏互斥。
 - cron 仍可在每分钟 0/30 秒触发，负责启动/兜底；窗口运行期间的抓取由 worker 自己调度。全局运行锁覆盖完整窗口，最多一组 `CRAWL_WORKER_COUNT` 个 worker 和一个触发等锁，额外 cron 触发跳过不等于跳过正在驻留调度的目标。所有 worker 退出并完成日志维护后才释放锁，新旧 worker 数不会交叠。每个窗口内部消除逐轮汇合等待，窗口换代仍需等最慢 worker 和下一次有效触发，不能承诺每个目标硬实时 30 秒。锁不覆盖绕过脚本直接执行 Python 的进程，也不是跨服务器数据库任务锁。
 - `xvfb-run -a -n` 从 90+worker index 开始选择空闲显示号。脚本显式设置 APP_ENV=prod、自带 Chromium、headed 模式，须有可用 Xvfb。`Missing X server or $DISPLAY` 是浏览器启动错误，不能当作详情选择器错误。
-- Python 在首个有效且本轮需执行的目标才创建 Playwright driver；全轮跳过时不启动 driver 或 Chromium。G2G 需要页面时才创建浏览器和 G2G context/page，并在同一 worker 的整个窗口内复用；使用 G2G 页面的目标结束后（成功或失败）限时导航至 `about:blank`，减少后续 API 请求和到期等待期间的网页后台活动；页面暂停失败时限时关闭 G2G context，失败再关闭 browser，初始化中途失败同样回收。断连 browser 下次重建；旧 browser 持续无法回收时保留唯一待清理引用，先重试清理，仍失败则拒绝叠加新 browser。关闭 context/browser 限时 3 秒并告警，不覆盖已保存/已通知的结果；退出仍释放 Playwright。ELD API 失败可复用同一个浏览器进行 DOM 兜底。shell 仍为每个 worker 启动 Xvfb，仅使用 G2G/ELD API 的成功轮次省掉的是 Python 中的 Chromium 与页面资源，并未取消 Xvfb 或 Python/Playwright driver 的启动开销。
+- Python 在首个有效且本轮需执行的 G2G/ELD 目标才创建 Playwright driver；全轮跳过时不启动 driver 或 Chromium。G2G 需要页面时才创建浏览器和 G2G context/page，并在同一 worker 的整个窗口内复用；使用 G2G 页面的目标结束后（成功或失败）限时导航至 `about:blank`，减少后续 API 请求和到期等待期间的网页后台活动；页面暂停失败时限时关闭 G2G context，失败再关闭 browser，初始化中途失败同样回收。断连 browser 下次重建；旧 browser 持续无法回收时保留唯一待清理引用，先重试清理，仍失败则拒绝叠加新 browser。关闭 context/browser 限时 3 秒并告警，不覆盖已保存/已通知的结果；退出仍释放 Playwright。ELD API 失败可复用同一个浏览器进行 DOM 兜底。shell 仍为每个 worker 启动 Xvfb，仅使用 G2G/ELD API 的成功轮次省掉的是 Python 中的 Chromium 与页面资源，并未取消 Xvfb 或 Python/Playwright driver 的启动开销。
 - 日志使用固定 `crawl.log`、`crawl_worker_N.log`、`xvfb_worker_N.log`；不为每轮生成时间戳日志文件。启动脚本在等待所有 worker 退出后、仍持 `crawl.lock` 时，用固定标准库入口直接调用 `tools.cleanup_logs.cleanup`，按 20 MiB / 3 份 / 7 天规则维护，不二次取锁、不加载业务配置；维护失败另记日志但不覆盖 worker 汇总退出码。这样驻留窗口也有固定维护机会。独立维护入口 `bash cleanup_logs.sh` 调用 `tools/cleanup_logs.py`，优先使用项目 venv，否则使用 python3，只依赖标准库，不加载环境配置或访问数据库。
 - 清理默认处理项目 `logs/` 的上述固定日志和 `cron.log`：单文件超过 20 MiB 时压缩为 `原名.纳秒时间戳.gz`，压缩成功并落盘后原地截断当前文件，保留 inode。每个日志最多保留 3 个备份，并删除 mtime 超过 7 天的备份；兼容旧数字后缀 `.1`、`.1.gz` 等，旧未压缩备份按同样保留规则处理。超过 7 天的旧 `xvfb_YYYYMMDD_HHMMSS_PID_worker_N.log` 也删除。小日志和空的固定日志保留；仅匹配目录第一层普通文件，不跟随文件符号链接，不清理未知文件、子目录或锁文件。
 - 清理复用 `crawl.lock`，最多等待 30 秒；爬虫或另一清理进程持续持锁时输出跳过并返回 0，其他 IO/压缩错误返回非零，压缩未成功时不截断源日志。持锁期间生产 worker 不运行；绕过启动脚本的写入不受保护，启动触发的锁等待/跳过日志仍可能与 `crawl.log` 的复制截断并发，极短窗口内这些行可能丢失。`crawl.lock`、`crawl_wait.lock` 均不删除。`--dry-run` 仅预览日志操作（仍获取运行锁，缺少锁文件时会创建它）。

@@ -94,6 +94,54 @@ def increment_version(target_id: int) -> int:
         conn.close()
 
 
+def save_purchase_snapshot(target: dict, items: list, started_at: datetime) -> int:
+    """原子保存收货快照。抓取期间任务已变更或其他 worker 已保存时放弃本批。"""
+    previous_version = int(target.get("version") or 0)
+    version = previous_version + 1
+    target_id = target["id"]
+    product_id = target["game_product_id"]
+    now = datetime.now()
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE crawl_target SET version = %s, last_crawl_at = %s
+                WHERE id = %s AND COALESCE(version, 0) = %s AND task_type = 1
+                  AND game_product_id = %s AND BINARY url = %s AND crawl_server = %s
+                  AND status = 1 AND deleted_at IS NULL
+                """,
+                (version, started_at, target_id, previous_version,
+                 product_id, target["url"], config.CRAWL_SERVER),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("收货任务配置或版本已变更，丢弃本轮结果")
+            if items:
+                cur.executemany(
+                    """
+                    INSERT INTO purchase_data (
+                        target_id, game_product_id, version, seller_name, deal_rate, region,
+                        stock, sales_unit, line_quantity, line_stock_amount, line_total,
+                        price, currency, offer_url, crawled_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    """,
+                    [(target_id, product_id, version, item.get("seller_name") or "",
+                      item["deal_rate"], item["region"], item["stock"], item["sales_unit"],
+                      item["line_quantity"], item["line_stock_amount"], item["line_total"],
+                      item["price"], "CNY", item.get("offer_url") or "", now)
+                     for item in items],
+                )
+        conn.commit()
+        return version
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def save_crawl_data(
     target_id: int,
     platform: str,
