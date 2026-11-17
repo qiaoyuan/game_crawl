@@ -139,3 +139,7 @@ Linux 独立监控进程读取 /proc 和系统负载，默认每10秒通过内�
 每个样本在同一事务中登记/锁定机器、去重、更新分钟计数/和/峰值及最新快照。last_report_at 使用数据库时间；重复或落后的采样跳过，过早/未来时间校验与 PHP 查询语义见后台 docs/server-monitor.md。失败时关闭连接，等下一轮新样本；日志记录错误类型和数字错误码。--dry-run 在 Linux 上只采一次，不连接数据库。
 
 监控由原生 crontab 每分钟用 flock 非阻塞拉起，每台一个常驻进程，独立 .server_monitor.lock 与爬虫运行锁分开。完整命令见 docs/server-monitor.md。
+
+## 收货保底价通知
+
+收货快照、任务版本与crawl_notify同事务提交，共用通知领取/重试/目标租约，消费按task_type分流。收货按通知版本及id升序取前10条；满10条取第3至8条，不满10条取全部。Y=sum(line_total)/sum(stock)，A=Y/(0.830832*usd_cny_rate)。汇率直接读取admin_config，空快照或无效金额/库存/汇率报错重试。按收货任务产品关联price_strategy_product，锁策略行后写独立purchase_floor_price，purchase_floor_data JSON仅保存A/Y/R/calculated_at（秒级时间）。purchase_floor_notify_id防止旧通知或重复通知覆盖；策略绑定多个产品时采用通知ID最新的计算结果。列表在最低价相邻位置显示独立收货保底价，不参与现有最低价或真实改价。后台迁移sql/alter_price_strategy_add_purchase_floor.sql后先部署PHP消费者再部署Python通知生产。

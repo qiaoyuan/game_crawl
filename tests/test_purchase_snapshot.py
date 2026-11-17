@@ -156,7 +156,9 @@ class PurchaseTransactionTests(unittest.TestCase):
     def test_confirmed_empty_snapshot_updates_version_without_inserting_rows(self):
         version = db.save_purchase_snapshot(purchase_target(), [], datetime.now())
         self.assertEqual(version, 8)
-        lock, update = self.cursor.execute.call_args_list
+        lock, update, notify = self.cursor.execute.call_args_list
+        self.assertIn("INSERT INTO crawl_notify", notify.args[0])
+        self.assertEqual(notify.args[1], (8, 8, 0))
         self.assertIn("FOR UPDATE", lock.args[0])
         self.assertIn("UPDATE crawl_target SET version", update.args[0])
         self.cursor.executemany.assert_not_called()

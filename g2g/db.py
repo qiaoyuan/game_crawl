@@ -137,6 +137,10 @@ def save_purchase_snapshot(target: dict, items: list, started_at: datetime) -> i
                       item["price"], "CNY", item.get("offer_url") or "", now)
                      for item in items],
                 )
+            cur.execute(
+                "INSERT INTO crawl_notify (crawl_target_id, version, crawled_count, status, crawled_at, created_at, updated_at) VALUES (%s,%s,%s,0,NOW(),NOW(),NOW())",
+                (target_id, version, len(items)),
+            )
         conn.commit()
         return version
     except Exception:
