@@ -10,7 +10,7 @@ from tools import crawl_from_db
 
 
 def purchase_target():
-    return {"id": 8, "game_product_id": 13, "task_type": "1", "version": 7,
+    return {"id": 8, "game_product_id": 13, "task_type": "2", "version": 7,
             "url": "https://www.dd373.com/s-game-c-coin-realm.html",
             "category": "物品", "crawl_type": 1}
 
@@ -46,19 +46,19 @@ class PurchaseRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_purchase_route_isolated_from_competitor_workflow(self):
         self.source.return_value = [purchase_row()]
         self.database.save_purchase_snapshot.return_value = 8
-        for task_type in (1, "1"):
+        for task_type in (2, "2"):
             with self.subTest(task_type=task_type):
                 target = dict(purchase_target(), task_type=task_type)
                 saved, failed, wall, _ = await crawl_from_db.crawl_target(self.session, 0, target, 1)
                 self.assertEqual((saved, failed, target["version"]), (1, False, 8))
-                self.source.assert_awaited_with(target["url"], route_cache=self.session.dd373_routes, limit=0)
+                self.source.assert_awaited_with(target["url"], route_cache=self.session.dd373_routes, limit=10)
                 self.database.save_purchase_snapshot.assert_called_with(
                     target, self.source.return_value, datetime.fromtimestamp(wall).replace(microsecond=0),
                 )
-                self.assertIn("task_type=1（收货）", self.output.getvalue())
+                self.assertIn("task_type=2（收货）", self.output.getvalue())
 
     async def test_purchase_passes_each_targets_limit_as_an_integer(self):
-        for value, expected in [(0, 0), ("0", 0), (3, 3), ("05", 5)]:
+        for value, expected in [(10, 10), ("10", 10), (30, 30), ("015", 15)]:
             with self.subTest(value=value):
                 target = dict(purchase_target(), limit=value)
                 self.source.return_value = []
@@ -67,7 +67,7 @@ class PurchaseRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.source.assert_awaited_with(target["url"], route_cache=self.session.dd373_routes, limit=expected)
 
     async def test_invalid_purchase_limit_fails_before_fetch_or_write(self):
-        for value in (None, "", -1, "-1", "1.0", 1.5, True):
+        for value in (0, 9, None, "", -1, "-1", "1.0", 1.5, True):
             with self.subTest(value=value):
                 result = await crawl_from_db.crawl_target(self.session, 0, dict(purchase_target(), limit=value), 1)
                 self.assertEqual(result, (0, True, None, None))
@@ -100,8 +100,8 @@ class PurchaseRouteTests(unittest.IsolatedAsyncioTestCase):
         dd373_url = purchase_target()["url"]
         g2g_url = "https://www.g2g.com/example"
         for task_type, category, url in (
-            (0, "物品", dd373_url), ("0", "DD373游戏币", g2g_url),
-            (2, "物品", g2g_url), ("unknown", "物品", g2g_url),
+            (1, "物品", dd373_url), ("1", "DD373游戏币", g2g_url),
+            (3, "物品", g2g_url), ("unknown", "物品", g2g_url),
         ):
             target = dict(purchase_target(), task_type=task_type, category=category, url=url)
             with self.subTest(task_type=task_type, category=category, url=url):
@@ -116,16 +116,16 @@ class PurchaseRouteTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(crawl_from_db.dd373, "_get_json", new_callable=AsyncMock) as request:
             result = await crawl_from_db.crawl_target(self.session, 0, target, 1)
         self.assertEqual(result, (0, True, None, None))
-        self.assertIn("task_type=1（收货）", self.output.getvalue())
+        self.assertIn("task_type=2（收货）", self.output.getvalue())
         self.assertIn("DD373 普通商品列表原始链接", self.output.getvalue())
-        self.source.assert_awaited_once_with(target["url"], route_cache=self.session.dd373_routes, limit=0)
+        self.source.assert_awaited_once_with(target["url"], route_cache=self.session.dd373_routes, limit=10)
         request.assert_not_awaited()
         self.database.save_purchase_snapshot.assert_not_called()
 
 
 class CompetitorRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_zero_and_legacy_targets_keep_competitor_collection_and_notification(self):
-        for fields in ({"task_type": 0}, {"task_type": "0"}, {}):
+        for fields in ({"task_type": 1}, {"task_type": "1"}, {}):
             with self.subTest(fields=fields), patch.object(crawl_from_db, "db") as database:
                 target = {"id": 5, "game_product_id": 13, "category": "物品", "limit": 1,
                           "url": "https://www.g2g.com/example", **fields}
@@ -137,7 +137,7 @@ class CompetitorRouteTests(unittest.IsolatedAsyncioTestCase):
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     result = await crawl_from_db.crawl_target(session, 0, target, 1)
                 self.assertEqual(result[:2], (1, False))
-                self.assertIn("task_type=0（竞品）", output.getvalue())
+                self.assertIn("task_type=1（竞品）", output.getvalue())
                 scrape.assert_awaited_once_with(session.get_g2g_page.return_value, target["url"])
                 database.save_crawl_data.assert_called_once_with(5, "g2g", items, game_product_id=13, version=4)
                 database.insert_crawl_notify.assert_called_once_with(5, 4, 1)

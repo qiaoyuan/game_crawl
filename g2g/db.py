@@ -107,7 +107,7 @@ def save_purchase_snapshot(target: dict, items: list, started_at: datetime) -> i
             cur.execute(
                 """
                 SELECT * FROM crawl_target
-                WHERE id = %s AND COALESCE(version, 0) = %s AND task_type = 1
+                WHERE id = %s AND COALESCE(version, 0) = %s AND task_type = 2
                   AND game_product_id = %s AND BINARY url = %s AND crawl_server = %s
                   AND status = 1 AND deleted_at IS NULL
                 FOR UPDATE

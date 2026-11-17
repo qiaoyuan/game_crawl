@@ -1512,8 +1512,8 @@ async def crawl_target(session, idx, target, total):
     name = target.get("name", "")
     category = str(target.get("category") or "").strip()
 
-    task_type = str(target.get("task_type", 0))
-    purpose = {"0": "竞品", "1": "收货"}.get(task_type, "未知")
+    task_type = str(target.get("task_type", 1))
+    purpose = {"1": "竞品", "2": "收货"}.get(task_type, "未知")
     category_label = category or "未设置类别"
     print(
         f"\n[{idx+1}/{total}] {name} "
@@ -1525,12 +1525,12 @@ async def crawl_target(session, idx, target, total):
     inserted = 0
     used_g2g_page = False
     try:
-        if task_type == "1":
-            limit = target.get("limit", 0)
+        if task_type == "2":
+            limit = target.get("limit", 10)
             if isinstance(limit, str) and limit.isascii() and limit.isdecimal():
                 limit = int(limit)
-            if type(limit) is not int or limit < 0:
-                raise ValueError("收货 limit 必须为非负整数")
+            if type(limit) is not int or limit < 10:
+                raise ValueError("收货 limit 必须为不少于10的整数")
             started_wall, started_mono = time.time(), monotonic()
             crawl_started_at = datetime.fromtimestamp(started_wall).replace(microsecond=0)
             with timed_stage("DD373 收货报价"):
@@ -1540,11 +1540,11 @@ async def crawl_target(session, idx, target, total):
             print(f"  -> 收货快照完成: version={version}，新增 {len(items)} 条，"
                   f"耗时 {perf_counter() - target_started:.2f} 秒", flush=True)
             return len(items), False, started_wall, started_mono
-        if task_type != "0":
+        if task_type != "1":
             raise ValueError(f"未知任务类型: {task_type}")
         hostname = urlsplit(url).hostname or ""
         if category == "DD373游戏币" or hostname == "dd373.com" or hostname.endswith(".dd373.com"):
-            raise ValueError("当前任务用途是竞品（task_type=0），DD373 类别或链接请配置到收货任务（task_type=1）")
+            raise ValueError("当前任务用途是竞品（task_type=1），DD373 类别或链接请配置到收货任务（task_type=2）")
         platform = "eldorado" if "eldorado.gg" in url else "g2g"
         # 1 优先按绑定店铺加强，空名单按策略 Top3 加强；均保存全部候选。
         crawl_type = target.get("crawl_type") or 0

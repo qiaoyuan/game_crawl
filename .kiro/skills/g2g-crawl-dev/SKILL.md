@@ -41,7 +41,7 @@ description: 维护本项目 G2G/ELD 竞品及 DD373 收货数据库任务爬虫
 
 ## DD373 收货数据
 
-- 任务用途 `task_type` 与竞品的加强选项 `crawl_type` 独立。用途 0 为竞品（旧记录迁移默认值；Python 兼容缺少字段的旧数据），1 为收货，两者支持数字字符串；未知值报错。每个目标的开始日志同时打印 target_id、game_product_id、task_type 的值和中文用途、category。后台同一产品可分别绑定一个未删除的竞品任务和一个收货任务。收货优先按任务用途进入 DD373 报价入口，即使旧分类写了「物品」也只验证 DD373 列表链接。竞品任务若带 DD373 分类或 DD373 域名，会在递增版本和启动浏览器前报配置错误。收货走同一服务器分片和调度，跳过竞品店铺过滤、加强、策略及改价通知。
+- 任务用途 `task_type` 与竞品的加强选项 `crawl_type` 独立。用途 1 为竞品（旧记录迁移默认值；Python 兼容缺少字段的旧数据），1 为收货，两者支持数字字符串；未知值报错。每个目标的开始日志同时打印 target_id、game_product_id、task_type 的值和中文用途、category。后台同一产品可分别绑定一个未删除的竞品任务和一个收货任务。收货优先按任务用途进入 DD373 报价入口，即使旧分类写了「物品」也只验证 DD373 列表链接。竞品任务若带 DD373 分类或 DD373 域名，会在递增版本和启动浏览器前报配置错误。收货走同一服务器分片和调度，跳过竞品店铺过滤、加强、策略及改价通知。
 - 收货链接采用 `https://www.dd373.com/s-<游戏>-c-<商品类型>-<区服层级...>.html`，要求具体区服且没有查询参数或片段。根据 [DD373 官方游戏目录](https://kf.dd373.com/helpdetail/e5675fb48f6a42e4a59ae5712b132965.html) 取得游戏、游戏币类型与各层级的 ID 和名称，按父级和短码逐级核对，末级须无下属区服；名称以目录为准。用 GameId、GameOtherId（按顺序以下划线拼接）及 GameShopTypeId 匿名查询 [普通商品比例接口](https://kf.dd373.com/helpdetail/dc862c7b70d74880968d2386e544b5bf.html) 的 `ApiGetShopList`。采集的是站内「立即购买」卖方报价，适用于后台核算收货成本。每个 worker 在当前运行窗口按完整 URL 复用已核实的目录映射；不同 URL 分开解析，退出时释放。报价每轮通过标准 HTTP 请求读取一次，不翻页，无需 Cookie 或浏览器。
 - 每个收货任务单独设置 `crawl_target.limit`，默认 0。0 或旧表缺列时省略请求参数，处理接口本轮返回的全部报价。正数 N 作为 `limit` 传给商品接口，并按响应原序取前 N 条再解析和保存。平台可能忽略请求参数，实际入库上限由 worker 保证。上限只用于本轮报价请求，不写入目录缓存。
 - `sales_unit` 为 1 个接口单位（如 1 万基纳），`price` 取 singleprice 的人民币单价；`line_quantity` 取每件数量 amount，`line_total` 取接口整件人民币价格 price；库存 `stock = number × amount`，库存人民币金额 `line_stock_amount = number × price`，按分四舍五入。使用 Decimal。接口缺少成交率、店铺名和详情链接，默认分别保存 NULL、空串、空串。
@@ -143,3 +143,5 @@ Linux 独立监控进程读取 /proc 和系统负载，默认每10秒通过内�
 ## 收货保底价通知
 
 收货快照、任务版本与crawl_notify同事务提交，共用通知领取/重试/目标租约，消费按task_type分流。收货按通知版本及id升序取前10条；满10条取第3至8条，不满10条取全部。Y=sum(line_total)/sum(stock)，A=Y/(0.830832*usd_cny_rate)。汇率直接读取admin_config，空快照或无效金额/库存/汇率报错重试。按收货任务产品关联price_strategy_product，锁策略行后写独立purchase_floor_price，purchase_floor_data JSON仅保存A/Y/R/calculated_at（秒级时间）。purchase_floor_notify_id防止旧通知或重复通知覆盖；策略绑定多个产品时采用通知ID最新的计算结果。列表在最低价相邻位置显示独立收货保底价，不参与现有最低价或真实改价。后台迁移sql/alter_price_strategy_add_purchase_floor.sql后先部署PHP消费者再部署Python通知生产。
+
+- 当前任务用途统一为1竞品（默认）/2收货，通知分流、策略筛选及Python锁行条件一致；升级必须暂停全部生产者/消费者，旧0/1数据只执行一次sql/migrate_task_type_1_2.sql后整体发布再恢复。收货limit至少10，旧小于10配置迁移为10；接口实际不足10仍用全部返回记录计算。
