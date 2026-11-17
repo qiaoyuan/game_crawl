@@ -18,7 +18,7 @@ def purchase_target():
 def purchase_row():
     return {"deal_rate": Decimal("95.9"), "region": "示例区服", "stock": 6000,
             "sales_unit": "1万基纳", "line_quantity": 1000,
-            "line_stock_amount": Decimal("173.40"), "line_total": Decimal("28.90"),
+            "line_stock_amount": Decimal("173.40"), "line_total": Decimal("173.40"),
             "price": Decimal("0.0289"), "currency": "CNY"}
 
 
@@ -165,8 +165,8 @@ class PurchaseTransactionTests(unittest.TestCase):
         self.connection.commit.assert_called_once()
 
     def test_batch_preserves_offer_order_version_and_rmb_precision(self):
-        offers = [purchase_row(), dict(purchase_row(), price=Decimal("0.01875")),
-                  dict(purchase_row(), stock=1000)]
+        offers = [purchase_row(), dict(purchase_row(), price=Decimal("0.01875"), line_total=Decimal("112.50")),
+                  dict(purchase_row(), stock=1000, line_total=Decimal("28.90"))]
         version = db.save_purchase_snapshot(purchase_target(), offers.copy(), datetime.now())
         self.assertEqual(version, 8)
         sql, rows = self.cursor.executemany.call_args.args

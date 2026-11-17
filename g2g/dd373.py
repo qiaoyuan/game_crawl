@@ -3,7 +3,7 @@
 import asyncio
 import re
 from collections import Counter
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 
 import requests
 from bs4 import BeautifulSoup
@@ -43,6 +43,20 @@ def _positive_amount(row, field):
     return value
 
 
+def _stored_decimal(value, scale, multiplier=Decimal(1)):
+    """精确相乘，再按 purchase_data 的 DECIMAL(20, scale) 一次舍入。"""
+    with localcontext() as ctx:
+        ctx.prec = max(40, len(value.as_tuple().digits) + len(multiplier.as_tuple().digits))
+        product = value * multiplier
+        bound = Decimal(10) ** (20 - scale)
+        if product >= bound:
+            raise ValueError("DD373 数值超出收货表精度")
+        stored = product.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP)
+        if stored >= bound:
+            raise ValueError("DD373 数值超出收货表精度")
+        return stored
+
+
 def parse_shop_offers(payload, region, *, limit=0):
     rows = dd373_result(payload)
     if not isinstance(rows, list):
@@ -57,9 +71,11 @@ def parse_shop_offers(payload, region, *, limit=0):
         if lots != lots.to_integral_value():
             raise ValueError("DD373 发布件数必须为整数")
         quantity = _positive_amount(row, "amount")
-        stock = lots * quantity
-        unit_price = _positive_amount(row, "singleprice")
-        line_total = _positive_amount(row, "price")
+        stock = _stored_decimal(quantity, 4, lots)
+        unit_price = _stored_decimal(_positive_amount(row, "singleprice"), 8)
+        if not stock or not unit_price:
+            raise ValueError("DD373 库存或销售单价舍入后为零")
+        bundle_price = _positive_amount(row, "price")
         offers.append({
             "seller_name": "",
             "deal_rate": None,
@@ -69,8 +85,8 @@ def parse_shop_offers(payload, region, *, limit=0):
             "price": unit_price,
             "currency": "CNY",
             "line_quantity": quantity,
-            "line_stock_amount": (lots * line_total).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-            "line_total": line_total,
+            "line_stock_amount": _stored_decimal(bundle_price, 2, lots),
+            "line_total": _stored_decimal(stock, 2, unit_price),
             "offer_url": "",
         })
     return offers

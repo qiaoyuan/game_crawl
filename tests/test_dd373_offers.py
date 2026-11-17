@@ -23,8 +23,17 @@ class OfferTests(unittest.TestCase):
             "seller_name": "", "deal_rate": None, "region": "欧服/魔族/测试服",
             "stock": Decimal("6000"), "sales_unit": "1万基纳", "price": Decimal("0.0289012"),
             "currency": "CNY", "line_quantity": Decimal("1000"),
-            "line_stock_amount": Decimal("173.40"), "line_total": Decimal("28.90"), "offer_url": "",
+            "line_stock_amount": Decimal("173.40"), "line_total": Decimal("173.41"), "offer_url": "",
         })
+
+    def test_total_uses_stored_stock_and_price_then_rounds_half_up(self):
+        # 舍入前的乘积小于 1.005，入库两列相乘恰好 1.005。
+        row, = dd373.parse_shop_offers(response(offer(
+            number="1", amount="0.99995", singleprice="1.004999995", price="1.01",
+        )), "测试")
+        self.assertEqual(row["stock"], Decimal("1.0000"))
+        self.assertEqual(row["price"], Decimal("1.00500000"))
+        self.assertEqual(row["line_total"], Decimal("1.01"))
 
     def test_only_explicit_successful_empty_list_is_empty(self):
         self.assertEqual(dd373.parse_shop_offers(response(), "测试"), [])
@@ -36,7 +45,8 @@ class OfferTests(unittest.TestCase):
 
     def test_one_invalid_offer_rejects_whole_snapshot(self):
         for changes in ({"unit": ""}, {"number": "1.2"}, {"price": "0"}, {"singleprice": "NaN"},
-                        {"singleprice": "Infinity"}, {"amount": None}, {"number": -1}):
+                        {"singleprice": "Infinity"}, {"amount": None}, {"number": -1},
+                        {"singleprice": "0.000000001"}, {"amount": "10000000000000000"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 dd373.parse_shop_offers(response(offer(), offer(**changes)), "测试")
 
@@ -45,14 +55,14 @@ class ScrapeTests(unittest.IsolatedAsyncioTestCase):
     async def test_rereads_prices_via_official_ordinary_goods_endpoint(self):
         params = {"GameId": "game", "GameOtherId": "server", "GameShopTypeId": "category"}
         route = AsyncMock(return_value=(params, "欧服/魔族/测试服"))
-        request = AsyncMock(side_effect=[response(offer()), response(offer(price="28.91"))])
+        request = AsyncMock(side_effect=[response(offer()), response(offer(singleprice="0.02891", price="28.91"))])
         with (patch.object(dd373, "resolve_dd373_route", route), patch.object(dd373, "_get_json", request),
               patch.object(dd373.config, "DD373_FETCH_DEAL_RATES", False),
               patch.object(dd373, "_fetch_deal_rates") as page):
             first = await dd373.scrape_purchase_offers("listing")
             second = await dd373.scrape_purchase_offers("listing")
-        self.assertEqual(first[0]["line_total"], Decimal("28.90"))
-        self.assertEqual(second[0]["line_total"], Decimal("28.91"))
+        self.assertEqual(first[0]["line_total"], Decimal("173.41"))
+        self.assertEqual(second[0]["line_total"], Decimal("173.46"))
         page.assert_not_called()
         self.assertEqual(request.await_count, 2)
         request.assert_awaited_with(dd373.SHOP_LIST_API, params)
@@ -60,7 +70,7 @@ class ScrapeTests(unittest.IsolatedAsyncioTestCase):
     async def test_worker_caches_successful_routes_only_and_refreshes_offers_and_rates(self):
         lookup = AsyncMock(side_effect=[ValueError("目录失败"), ({"id": "a"}, "A"), ({"id": "b"}, "B")])
         request = AsyncMock(side_effect=[response(offer(shopno="a")),
-                                         response(offer(shopno="a", price="29.00")), response()])
+                                         response(offer(shopno="a", singleprice="0.029", price="29.00")), response()])
         cache = {}
         with (patch.object(dd373, "resolve_dd373_route", lookup), patch.object(dd373, "_get_json", request),
               patch.object(dd373.config, "DD373_FETCH_DEAL_RATES", True),
@@ -76,7 +86,7 @@ class ScrapeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.await_count, 3)
         self.assertEqual(page.call_count, 2)
         self.assertEqual((first[0]["deal_rate"], second[0]["deal_rate"]), (Decimal(10), Decimal(15)))
-        self.assertEqual(second[0]["line_total"], Decimal("29.00"))
+        self.assertEqual(second[0]["line_total"], Decimal("174.00"))
 
 
 def card(shopno, label):
@@ -143,7 +153,7 @@ class PurchaseLimitTests(unittest.IsolatedAsyncioTestCase):
         request = AsyncMock(return_value=payload)
         with (patch.object(dd373, "_get_json", request),
               patch.object(dd373.config, "DD373_FETCH_DEAL_RATES", False)):
-            for limit, prices in [(1, [42]), (2, [42, "28.9"]), (0, [42, "28.9", 35]), (30, [42, "28.9", 35])]:
+            for limit, prices in [(1, [252]), (2, [252, "173.4"]), (0, [252, "173.4", 210]), (30, [252, "173.4", 210])]:
                 with self.subTest(limit=limit):
                     rows = await dd373.scrape_purchase_offers("listing", cache, limit=limit)
                     self.assertEqual([r["line_total"] for r in rows], [Decimal(p) for p in prices])
