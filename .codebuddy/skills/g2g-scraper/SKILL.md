@@ -7,6 +7,7 @@ description: |
   3. 导出卖家 Offers (bulk_export)
   4. 爬取 Eldorado.gg 商户数据
   5. 管理 G2G 登录会话（含 OTP 验证）
+  6. 监控 Eldorado 售出订单列表、订单详情与聊天记录
   Trigger keywords: G2G, 爬数据, scrape, 导出, export, 商户, seller, offers, 产品, product, eldorado
 ---
 
@@ -26,7 +27,7 @@ g2g/
 │   ├── scrape_category.py      # 爬取 G2G 分类页商户（无需登录）
 │   ├── scrape_eldorado.py      # 爬取 Eldorado.gg 商户（无需登录）
 │   ├── update_boc_usd_rate.py  # 手动更新中行美元汇率
-│   ├── monitor_eldorado.py     # 连接已开启 CDP 的浏览器，监控当前订单详情及聊天
+│   ├── monitor_eldorado.py     # 连接已开启 CDP 的浏览器，监控手动订单详情、Aion 2 新单或全页订单聊天
 │   ├── export_offers.py        # 导出 Offers（需登录）
 │   └── scrape_seller.py        # 爬取商户数据（需登录）
 ├── downloads/                  # 输出目录
@@ -64,11 +65,43 @@ python -m tools.scrape_eldorado "https://www.eldorado.gg/..."
 ```
 
 ### 监控 Eldorado 订单详情与聊天
+
+用户指定订单号或详情链接，要求按次记录一笔订单或读取该单聊天时，使用 [Eldorado 单笔订单采集规范](../../../.agents/skills/eldorado-manual-order/SKILL.md)。
+
 ```bash
 mkdir -p downloads
 python -m tools.monitor_eldorado --chrome-auto-connect --output downloads/eldorado_orders.jsonl
 ```
-先在已启用远程调试的 Chrome 中人工登录并打开订单详情。`--chrome-auto-connect` 通过 macOS Chrome 的 DevToolsActivePort 发现已有浏览器，连接时按提示允许；也可通过 `--cdp-url` 指定其他 Chromium 调试地址。每 3 秒读取首个匹配的 `/order/` 页面，可通过 `--interval` 和 CSS 选择器参数调整。程序不自动点击、刷新或遍历订单，首次读取和内容变化时向终端输出 JSON Lines，可选文件追加保存。聊天位于 TalkJS iframe，提取可见消息文本、绝对时间、方向及附件名称；结构不匹配时回退到可见文本。页面结构变化、虚拟滚动或尚未加载的内容可能影响结果。文件及终端输出含订单和对话信息，按敏感数据保管。
+先在已启用远程调试的 Chrome 中人工登录并打开订单详情。`--chrome-auto-connect` 通过 macOS Chrome 的 DevToolsActivePort 发现已有浏览器，连接时按提示允许；也可通过 `--cdp-url` 指定其他 Chromium 调试地址。每 3 秒读取首个匹配的 `/order/` 页面，可通过 `--interval` 和 CSS 选择器参数调整。此手动详情模式不自动刷新或遍历订单，首次读取和内容变化时向终端输出 JSON Lines，可选文件追加保存。聊天位于 TalkJS iframe，提取可见消息文本、绝对时间、方向及附件名称；结构不匹配时回退到可见文本。页面结构变化、虚拟滚动或尚未加载的内容可能影响结果。文件及终端输出含订单和对话信息，按敏感数据保管。
+
+### 每 30 秒检查 Eldorado 售出列表最新一笔
+
+在已登录的 Chrome 中打开售出订单列表，按 Recent 排序，然后从项目根目录运行：
+
+```bash
+venv/bin/python -m tools.monitor_eldorado --sold-orders --chrome-auto-connect
+```
+
+- 首轮立即刷新，以列表第一笔建立起点。之后每 30 秒只判断列表第一笔，它是新的 Aion 2 订单才入队。下单时间取可见 Ordered date，按浏览器当地时区转为 UTC。显示的排序或时间无效时，本轮不推进起点。
+- 最新时间之后的订单，或与最新时间相同且尚未见过的订单号，均纳入新单判断。所有游戏参与更新时间，只对 Aion 2 打开临时详情页。已经发现的订单持久排队，详情未就绪会重试，即使后来已离开首位也可完成。如果监控使用的列表标签页进入订单详情，程序会在同一会话另开售出列表继续刷新，方便查看原详情。
+- 详情按可见订单号与链接核对身份，从 Order details 和 Payment details 提取游戏、地区、阵营、服务器、数量、买家、订单金额、佣金、实收，保留页面单位与符号。必需字段齐全时，连同订单号及 UTC 下单时间写成一行 JSON；不读取聊天来补字段。
+- 默认输出为 `downloads/eldorado_new_orders.jsonl`（`--output` 可指定独立文件）。同路径加 `.sqlite3` 的状态库保存起点、待处理订单及已记录 ID，须与记录文件配套保留。单进程独占写入，重启恢复待处理单及未写完的行；同一订单号只写一次。启动前先人工登录，关闭浏览器或监控所在的列表标签页会结束监控。验收及启动方式见 [采集规格](../../../docs/eldorado-sold-orders.md)。
+
+查看汇总请打开 `downloads/eldorado_new_orders.json`。该文件在启动恢复和每次录入后更新，包含所有已录入订单的 JSON 数组。自定义输出以 `.jsonl` 结尾时，汇总换成 `.json` 后缀，否则追加 `.json`。
+
+### 每 30 秒刷新 Eldorado 售出列表并读取 Aion 2 聊天
+
+在 Chrome 登录 Eldorado 并打开售出订单页，然后在项目根目录运行：
+
+```bash
+mkdir -p downloads
+venv/bin/python -m tools.monitor_eldorado --sold-chats --chrome-auto-connect --output downloads/eldorado_aion2_chats.jsonl
+```
+
+- 首轮立即刷新，之后默认以 30 秒为开始间隔刷新当前售出列表页。可用 `--interval` 覆盖。若未打开列表则在对应浏览器会话新建标签页。登录跳转后需在该标签页返回售出列表。
+- 从订单行的游戏名完整匹配 Aion 2 / Aion2，忽略大小写，包含各状态，仅取当前页。独立的详情读取任务按列表顺序在临时标签中逐笔进入同站订单，排队及正在处理的同一链接合并。详情耗时不延迟列表刷新。
+- 使用详情中的 TalkJS 聊天窗口，从最新位置向上滚动并合并重叠的消息，保留会话顺序和相同内容的独立发送。按页面标记区分收发，文件消息记录附件名，无文件名时记为「[附件]」。到顶且内容稳定约 1.2 秒结束。遇到明确的空会话提示可保存空列表。读取限时 20 秒，未就绪、无法拼接或超时会在之后发现该订单时重试，并保留上次成功记录。可读范围由网页实际加载的历史决定。
+- 终端与可选 JSONL 文件按订单在首次读取或聊天有变化时输出完整快照，captured_at 为 UTC 采集时间，重启后重新输出首份。详情 URL 去掉查询参数和片段。快照和聊天保存在本机，勿提交到版本库。详见 [采集规格](../../../docs/eldorado-sold-orders.md)。
 
 ### 手动更新中行美元汇率
 

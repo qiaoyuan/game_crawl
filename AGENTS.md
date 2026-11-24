@@ -8,6 +8,8 @@
 
 修改独立抓取、登录、会话和导出工具时，另读 [.codebuddy/skills/g2g-scraper/SKILL.md](.codebuddy/skills/g2g-scraper/SKILL.md)。其独立工具约定不能覆盖数据库生产爬虫的约定。
 
+按指定订单号或详情链接手动采集单笔 Eldorado 订单及其聊天时，使用 [Eldorado 单笔订单采集规范](.agents/skills/eldorado-manual-order/SKILL.md)。修改该工具时同步此规范。
+
 ## 每次改动后同步 skill
 
 完成 `g2g/**`、`tools/**`、`tests/**`、`sql/**`、`main.py`、启动/部署脚本、依赖或环境配置的相关修改后，在回复用户之前检查本次 diff 和最终源码，直接同步受影响 skill。
