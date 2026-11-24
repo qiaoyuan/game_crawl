@@ -5,6 +5,8 @@ description: 手动查询 Eldorado 最新一笔或指定的 Aion 2 售出订单�
 
 # 手动采集一笔 Eldorado 订单
 
+单笔采集实现在 `g2g/eldorado/manual/`，共享页面解析在 `g2g/eldorado/shared/`，本 skill 的测试在 `test/eldorado_manual_order/`。
+
 在项目根目录运行命令。将 `ORDER_ID_OR_URL` 替换为用户指定的完整 UUID 或对应的 Eldorado 订单详情链接。使用已登录卖家账户并开启远程调试的 Chrome。若浏览器弹出连接提示，请用户在 Chrome 中允许连接。
 
 ## 记录订单

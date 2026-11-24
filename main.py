@@ -23,16 +23,16 @@ def main():
     command = sys.argv[1]
 
     if command == "export":
-        from tools.export_offers import run
+        from g2g.scraper.export_offers import run
         asyncio.run(run())
     elif command == "scrape":
-        from tools.scrape_seller import run
+        from g2g.scraper.scrape_seller import run
         asyncio.run(run())
     elif command == "login":
-        from tools.export_offers import run  # 登录流程一样
+        from g2g.scraper.export_offers import run  # 登录流程一样
         asyncio.run(run())
     elif command == "reset":
-        from g2g.browser import clear_session
+        from g2g.scraper.browser import clear_session
         clear_session()
         print("[✓] 会话已清除，下次运行需重新登录")
     else:

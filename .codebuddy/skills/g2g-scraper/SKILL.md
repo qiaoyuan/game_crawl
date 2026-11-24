@@ -17,19 +17,16 @@ description: |
 
 ```
 g2g/
-├── g2g/                        # 核心库
-│   ├── config.py               # 配置（账号/URL/API/请求头）
-│   ├── browser.py              # 浏览器管理（创建/会话/反检测）
-│   ├── auth.py                 # 登录认证（自动填表 + 手动OTP + token提取）
-│   └── api.py                  # API 调用（bulk_export/卖家数据/通用请求）
-├── tools/                      # 工具集
-│   ├── scrape_g2g_products.py  # 爬取 G2G 产品卡片（无需登录，输出 JSON）
-│   ├── scrape_category.py      # 爬取 G2G 分类页商户（无需登录）
-│   ├── scrape_eldorado.py      # 爬取 Eldorado.gg 商户（无需登录）
-│   ├── update_boc_usd_rate.py  # 手动更新中行美元汇率
-│   ├── monitor_eldorado.py     # 连接已开启 CDP 的浏览器，监控手动订单详情、Aion 2 新单或全页订单聊天
-│   ├── export_offers.py        # 导出 Offers（需登录）
-│   └── scrape_seller.py        # 爬取商户数据（需登录）
+├── g2g/
+│   ├── config.py、db.py          # 项目配置与数据库访问
+│   ├── crawl/                   # 数据库生产爬虫
+│   ├── scraper/                 # 独立抓取、登录、导出与汇率更新
+│   └── eldorado/
+│       ├── manual/              # 按次采集一笔订单
+│       ├── monitor/             # 持续监控与新单状态记录
+│       └── shared/              # 浏览器连接、售出列表、详情与聊天读取
+├── tools/                       # 命令入口及独立部署的服务器监控脚本
+├── test/g2g_scraper/            # 本 skill 的测试
 ├── downloads/                  # 输出目录
 ├── session.json                # 登录会话（自动生成）
 ├── main.py                     # 主入口

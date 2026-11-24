@@ -10,9 +10,15 @@
 
 按指定订单号或详情链接手动采集单笔 Eldorado 订单及其聊天时，使用 [Eldorado 单笔订单采集规范](.agents/skills/eldorado-manual-order/SKILL.md)。修改该工具时同步此规范。
 
+## 模块与测试目录
+
+业务实现按职责归入 `g2g/crawl/`（数据库生产爬虫）、`g2g/scraper/`（独立工具）和 `g2g/eldorado/`。Eldorado 的单笔采集、持续监控及两者共用的页面读取逻辑分别放在 `manual/`、`monitor/`、`shared/`。命令入口保留在 `tools/`。服务器监控脚本支持单文件部署。
+
+所有测试脚本放在 `test/<skill 名称>/`，目录名将 skill 名称中的连字符换成下划线，例如 `test/eldorado_manual_order/`。每个测试文件按负责该行为的 skill 归档，共享行为的测试只保留一份。运行全量测试用 `venv/bin/python -m unittest discover -s test`。
+
 ## 每次改动后同步 skill
 
-完成 `g2g/**`、`tools/**`、`tests/**`、`sql/**`、`main.py`、启动/部署脚本、依赖或环境配置的相关修改后，在回复用户之前检查本次 diff 和最终源码，直接同步受影响 skill。
+完成 `g2g/**`、`tools/**`、`test/**`、`sql/**`、`main.py`、启动/部署脚本、依赖或环境配置的相关修改后，在回复用户之前检查本次 diff 和最终源码，直接同步受影响 skill。
 
 - 更新实际改变的配置默认值、字段、关联、分类分流、抓取范围、加强选择、价格来源、通知顺序、失败行为、锁、日志和执行方式。
 - 替换过时段落，保留仍成立的规则；删除文件时检查相关引用。仅维护已确认行为，不把计划或未经验证的服务器状态写成事实，不追加改动流水账。

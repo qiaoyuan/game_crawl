@@ -7,7 +7,7 @@ description: 维护本项目 G2G/ELD 竞品及 DD373 收货数据库任务爬虫
 
 ## 入口与职责
 
-- `tools/crawl_from_db.py` 是生产入口，其中 `CrawlSession` 按需管理 worker 的请求和浏览器资源；`g2g/db.py` 负责数据库读写，`g2g/crawl_filter.py` 决定空加强名单时的 Top3 对象。
+- `tools/crawl_from_db.py` 是生产入口，实现在 `g2g/crawl/crawl_from_db.py`，其中 `CrawlSession` 按需管理 worker 的请求和浏览器资源；`g2g/db.py` 负责数据库读写，`g2g/crawl/crawl_filter.py` 决定空加强名单时的 Top3 对象。
 - Python 按 `crawl_target.task_type` 分流。竞品保存到 `crawl_data` 并发送 `crawl_notify`，实际改价由 PHP 后台的 `price:strategy:consume` 执行。收货保存到 `purchase_data`，并在同一事务写入通知供 PHP 计算收货保底价。
 - 关联后台项目为 `/Users/qiaoyuan/www/php/base_admin`。后台旧手工 `CrawlService` 写 `competitor_product`，不是此生产链路。
 - 独立抓取、登录与导出工具另见项目 `.codebuddy/skills/g2g-scraper/SKILL.md`，不要把其 JSON 输出规则套到数据库入口。
@@ -115,7 +115,7 @@ description: 维护本项目 G2G/ELD 竞品及 DD373 收货数据库任务爬虫
 按改动选择相关检查，真实平台测试与本地 DOM 夹具区分，不能把夹具通过说成线上已恢复。
 
 ```bash
-rtk proxy venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+rtk proxy venv/bin/python -m unittest discover -s test/g2g_crawl_dev -p 'test_*.py'
 rtk proxy bash -n run_crawl_and_consume.sh
 rtk git diff --check
 ```
